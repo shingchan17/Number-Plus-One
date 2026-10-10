@@ -287,7 +287,8 @@ func _play_merge(ev: Dictionary, generation: int) -> void:
 		"region_count": ev.regions.size(),
 		"ghosts": 0,
 		"targets": [],
-		"results": [],
+		"results": [],                 # 合并结果数字：直接来自内核 result_value，UI 不重算
+		"player_merge": [],            # 玩家直接参与标记（仅记录，供测试核对；不做视觉区分）
 		"converge": [],
 	}
 	var other_ghosts: Array = []
@@ -296,7 +297,8 @@ func _play_merge(ev: Dictionary, generation: int) -> void:
 	for reg in ev.regions:
 		var target_rect := cell_rect(reg.target)
 		rec.targets.append(reg.target)
-		rec.results.append(reg.value + 1)
+		rec.results.append(reg.result_value)        # 内核产生的结果，动画只读取
+		rec.player_merge.append(reg.player_merge)
 		for idx in reg.cells:
 			var from_rect := cell_rect(idx)
 			_hide_static(idx)

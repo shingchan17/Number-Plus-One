@@ -17,7 +17,12 @@ const SEED := 20261010
 const SINGLE_TILE_BOARD := "5 . . . .\n. . . . .\n. . . . .\n. . . . .\n. . . . ."
 const EMPTY_ROWS := ". . . . .\n. . . . .\n. . . . .\n. . . . ."
 const MERGE_FIXTURE := "2 2 1 . .\n" + EMPTY_ROWS
-const CHAIN_FIXTURE := "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROWS
+## 旧规则的"两轮连锁"夹具（5 行）：新规则下第一轮是玩家直接合成，结果保持 4，
+## 底行变成 4,5,5 因此不再连锁 —— 用于锁定"玩家合成不再触发该连锁"这一行为变化。
+const CHAIN_FIXTURE := "4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . ."
+## 玩家直接合成 + 自动连锁：点击 (2,0) → 第一轮玩家合成（结果仍为 4）→ 重力后底行 4,4,4
+## → 第二轮自动连锁（结果 5）→ 最终只剩 (4,0) = 5。
+const PLAYER_CHAIN_FIXTURE := "4 . . . .\n4 . . . .\n3 . . . .\n. 4 4 . .\n. . . . ."
 
 var _passed := 0
 var _failed := 0
@@ -59,6 +64,7 @@ func _run() -> void:
 	await _test_click_updates_state()
 	await _test_empty_tile_rejected()
 	await _test_chain_shows_final_board()
+	await _test_player_merge_display()
 	await _test_revive_flow()
 	await _test_game_over_and_highscore()
 	await _test_restart_flow()
@@ -151,6 +157,8 @@ func _load_fixture(text: String, energy: int, score: int, revive_left: int) -> v
 	main.state.score = score
 	main.state.revive_left = revive_left
 	main.sync_ui()
+	# 防呆：夹具必须真的落在棋盘上（行数写错时立刻暴露，避免用例在随机棋盘上"碰巧通过"）
+	_eq_str("fixture applied", main.state.board_text(), text.strip_edges())
 
 
 func _remove_test_save() -> void:
@@ -251,24 +259,41 @@ func _test_empty_tile_rejected() -> void:
 
 func _test_chain_shows_final_board() -> void:
 	_section("连锁：界面显示结算完成后的最终棋盘（含重力下落）")
-	_load_fixture("4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . .", 2, 0, 1)
+	# 新规则：纵列 4,4,4 含点击格 → 玩家直接合成，结果仍是 4 → 重力后底行 4,4,4
+	# → 第二轮属于自动连锁（4 + 1 = 5）→ 最终只剩 (4,0) = 5
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 2, 0, 1)
 	main.board.tile_at(2, 0).pressed.emit()
 	await process_frame
 
-	# 新规则：纵列 4,4,4 → 合成 5 → 重力把 row0 的三个 5 压到底行 → 底行 5,5,5 → 再合成 6
-	# 结果最终落在 (4,0)，即索引 20
-	_eq_int("kernel board (4,0)", main.state.board[20], 6)
-	_eq_int("kernel score +33", main.state.score, 33)
+	_eq_int("kernel board (4,0)", main.state.board[20], 5)
+	_eq_int("kernel score 12 + 15", main.state.score, 27)
 	_eq_int("kernel energy 2-1+2", main.state.energy, 3)
 	_t("kernel board is stable", main.state.has_unresolved_matches() == false, main.state.board_text())
-	_eq_int("tile (4,0) shows 6", main.board.tile_at(4, 0).value, 6)
-	_eq_str("tile (4,0) text", main.board.tile_at(4, 0).text, "6")
+	_eq_int("tile (4,0) shows 5", main.board.tile_at(4, 0).value, 5)
+	_eq_str("tile (4,0) text", main.board.tile_at(4, 0).text, "5")
 	var leftovers := 0
 	for i in GS.CELL_COUNT:
 		if main.state.board[i] != GS.EMPTY:
 			leftovers += 1
 	_eq_int("only one tile remains", leftovers, 1)
 	_check_ui_matches_state("连锁后")
+
+
+func _test_player_merge_display() -> void:
+	_section("玩家直接合成：界面显示的数字保持不变")
+	main.start_new_game(SEED)
+	_load_fixture(MERGE_FIXTURE, 5, 0, 1)
+	main.board.tile_at(0, 2).pressed.emit()
+	await process_frame
+
+	# 点击 1 → 2，与左侧两个 2 合并；玩家直接参与 ⇒ 结果仍是 2
+	_eq_int("kernel result stays 2", main.state.board[20], 2)
+	_eq_int("kernel score 2 * 3", main.state.score, 6)
+	_eq_int("kernel energy 5-1+1", main.state.energy, 5)
+	_eq_int("tile value is 2", main.board.tile_at(4, 0).value, 2)
+	_eq_str("tile text is 2", main.board.tile_at(4, 0).text, "2")
+	_eq_int("only one tile left", main.state.tile_count(), 1)
+	_check_ui_matches_state("玩家直接合成后")
 
 
 func _test_revive_flow() -> void:
@@ -382,8 +407,8 @@ func _test_restart_flow() -> void:
 func _test_error_state() -> void:
 	_section("ERROR：显示错误信息并停止接受操作")
 	main.start_new_game(SEED)
-	_load_fixture("4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . .", 3, 0, 1)
-	main.state.max_chain_steps = 1                  # 逼出连锁上限异常
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 3, 0, 1)
+	main.state.max_chain_steps = 1                  # 逼出连锁上限异常（该夹具确定有 2 轮）
 	main.board.tile_at(2, 0).pressed.emit()
 	await process_frame
 
@@ -491,12 +516,18 @@ func _check_anim_matches_kernel(tag: String) -> void:
 	if ev_merges.size() < n:
 		n = ev_merges.size()
 	var merge_ok := true
+	var results_ok := true
+	var flags_ok := true
 	for i in n:
 		var h = h_merges[i]
 		var ev = ev_merges[i]
 		var expect_ghosts := 0
+		var expect_results: Array = []
+		var expect_flags: Array = []
 		for reg in ev.regions:
 			expect_ghosts += reg.size
+			expect_results.append(reg.result_value)
+			expect_flags.append(reg.player_merge)
 			for idx in reg.cells:
 				var found := false
 				for cvg in h.converge:
@@ -510,7 +541,14 @@ func _check_anim_matches_kernel(tag: String) -> void:
 					merge_ok = false
 		if h.ghosts != expect_ghosts:
 			merge_ok = false
+		# 动画显示的结果数字必须逐项等于内核 result_value（UI 不得自行 value + 1）
+		if str(h.results) != str(expect_results):
+			results_ok = false
+		if str(h.player_merge) != str(expect_flags):
+			flags_ok = false
 	_t("[%s] every region cell converges to its kernel target" % tag, merge_ok)
+	_t("[%s] animated result values equal kernel result_value" % tag, results_ok)
+	_t("[%s] player_merge flags match the kernel" % tag, flags_ok)
 
 	var g := h_gravs.size()
 	if ev_gravs.size() < g:
@@ -590,7 +628,14 @@ func _test_animations() -> void:
 	await _await_animation()
 	_eq_str("merge then gravity", _history_kinds(), "tap,merge,gravity")
 	_check_anim_matches_kernel("三连")
-	_eq_int("kernel result fell to (4,0)", main.state.board[20], 3)
+	# 玩家直接参与：点击 1 → 2，三个 2 合并后数字保持 2
+	_eq_int("kernel result fell to (4,0)", main.state.board[20], 2)
+	_eq_int("tile (4,0) shows the unchanged value", main.board.tile_at(4, 0).value, 2)
+	var m_hist := _history("merge")
+	if m_hist.size() == 1:
+		_eq_int("animated result is the player result", m_hist[0].results[0], 2)
+		_t("player merge flagged in the animation history", m_hist[0].player_merge[0] == true)
+		_t("converging ghosts show the matched value 2", m_hist[0].converge[0]["value"] == 2)
 	_check_no_leftovers("三连+重力")
 	_check_ui_matches_state("三连+重力后")
 
@@ -626,9 +671,9 @@ func _test_animations() -> void:
 	_check_no_leftovers("补充")
 	_check_ui_matches_state("补充后")
 
-	# ---- 4) 两轮连锁：必须逐轮播放
+	# ---- 4) 两轮连锁：第一轮玩家直接合成、第二轮自动连锁，必须逐轮播放
 	main.start_new_game(SEED)
-	_load_fixture("4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . .", 2, 0, 1)
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 2, 0, 1)
 	main.board.tile_at(2, 0).pressed.emit()
 	await process_frame
 	await process_frame
@@ -636,10 +681,30 @@ func _test_animations() -> void:
 	await _await_animation()
 	_eq_str("rounds played sequentially", _history_kinds(), "tap,merge,gravity,merge,gravity")
 	_check_anim_matches_kernel("连锁")
-	_eq_int("final kernel result", main.state.board[20], 6)
-	_eq_int("score after chain", main.state.score, 33)
+	_eq_int("final kernel result", main.state.board[20], 5)
+	_eq_int("score after chain (12 player + 15 auto)", main.state.score, 27)
+	var h_merges := _history("merge")
+	_eq_int("two merge rounds animated", h_merges.size(), 2)
+	if h_merges.size() == 2:
+		_eq_int("round 1 animates the player result (no +1)", h_merges[0].results[0], 4)
+		_t("round 1 flagged player_merge", h_merges[0].player_merge[0] == true)
+		_eq_int("round 2 animates the chained result (v + 1)", h_merges[1].results[0], 5)
+		_t("round 2 NOT flagged player_merge", h_merges[1].player_merge[0] == false)
+		_t("round 1 ghosts show the matched value 4", h_merges[0].converge[0]["value"] == 4)
+		_t("round 2 ghosts show the matched value 4", h_merges[1].converge[0]["value"] == 4)
 	_check_no_leftovers("连锁")
 	_check_ui_matches_state("连锁后")
+
+	# ---- 4b) 旧的两轮连锁夹具在新规则下只剩一轮（玩家合成结果不加一 ⇒ 不再触发连锁）
+	main.start_new_game(SEED)
+	_load_fixture(CHAIN_FIXTURE, 2, 0, 1)
+	main.board.tile_at(2, 0).pressed.emit()
+	await _await_animation()
+	_eq_str("player merge no longer chains here", _history_kinds(), "tap,merge,gravity")
+	_eq_int("row 4 keeps the untouched 5s", main.state.board[20], 4)
+	_eq_int("score is the player result only (4 * 3)", main.state.score, 12)
+	_check_ui_matches_state("旧夹具新规则")
+	_check_no_leftovers("旧夹具新规则")
 
 	# ---- 5) 动画期间的点击被忽略（不扣能量、不追加结算）
 	main.start_new_game(SEED)
@@ -652,7 +717,7 @@ func _test_animations() -> void:
 	_eq_int("only one tap step recorded", _history_count("tap"), 1)
 	await _await_animation()
 	_eq_int("still one tap step after the animation", _history_count("tap"), 1)
-	_eq_int("score unchanged by the ignored clicks", main.state.score, 9)
+	_eq_int("score unchanged by the ignored clicks (player result 2 * 3)", main.state.score, 6)
 
 	# ---- 6) 动画结束后可以继续正常点击
 	_eq_int("phase still PLAYING", main.state.phase, GS.Phase.PLAYING)
@@ -675,8 +740,8 @@ func _test_animations() -> void:
 
 	# ---- 8) ERROR 也延迟到动画结束，且不自动修复棋盘
 	main.start_new_game(SEED)
-	_load_fixture("4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . .", 3, 0, 1)
-	main.state.max_chain_steps = 1
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 3, 0, 1)
+	main.state.max_chain_steps = 1                  # 该夹具确定有 2 轮
 	main.board.tile_at(2, 0).pressed.emit()
 	_t("overlay hidden while animating", main.overlay.visible == false)
 	await _await_animation()
@@ -792,7 +857,7 @@ func _test_animation_cancel() -> void:
 	_sig_finished = 0
 	_sig_canceled = 0
 	main.start_new_game(SEED)
-	_load_fixture(CHAIN_FIXTURE, 2, 0, 1)
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 2, 0, 1)
 	main.board.tile_at(2, 0).pressed.emit()
 	await _await_until(func(): return _history_count("gravity") == 1, "round 1 gravity reached")
 	main.anim_layer.cancel_play()          # 此刻第 2 轮 merge 还不可能开始

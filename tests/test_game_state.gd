@@ -18,6 +18,15 @@ const SINGLE_TILE := "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY
 # 无任何 >=3 连通区域的满盘（横向成对，纵向交替）
 const PAIRS_BOARD := "2 2 1 1 2\n1 1 2 2 1\n2 2 1 1 2\n1 1 2 2 1\n2 2 1 1 2"
 
+## 玩家直接合成 + 自动连锁：点击 (2,0) 让纵列三个 4 成区域（含点击格 → 结果仍为 4），
+## 重力后底行形成 4,4,4 → 第二轮为自动连锁（4 + 1 = 5）。
+## 第 2 轮区域 {20,21,22} 不含点击格 10，因此即使把点击格坐标也算进去也不会误判。
+const PLAYER_CHAIN := "4 . . . .\n4 . . . .\n3 . . . .\n. 4 4 . .\n. . . . ."
+
+## 纯自动连锁（直接 resolve_all()，无点击）：连续 4 轮，每轮结果都比匹配值大 1。
+## 列 0 的 2,2,2 → 3；底行 3,3,3 → 4；列 1/2 落下的 4,4 → 5；再落下的 5,5 → 6。
+const AUTO_CASCADE := "2 . . . .\n2 . . . .\n2 5 5 . .\n. 4 4 . .\n. 3 3 . ."
+
 var _passed := 0
 var _failed := 0
 var _current := ""
@@ -32,6 +41,7 @@ func _initialize() -> void:
 	_test_gravity()
 	_test_top_refill()
 	_test_chain_by_refill()
+	_test_player_merge_rules()
 	_test_chain_and_energy()
 	_test_tap_rules()
 	_test_energy_and_game_over()
@@ -499,15 +509,16 @@ func _test_chain_and_energy() -> void:
 	_section("E2-E6 连锁、能量扣除与上限")
 	var gs = GS.new(16)
 	gs.spawn_enabled = false
-	# E2 两轮连锁：纵列 4 合成 5 → 重力后横排 5,5,5 → 再合成 6
-	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	# E2 两轮连锁：第一轮是玩家直接参与（纵列三个 4 合成后仍是 4）→ 重力后底行 4,4,4
+	#     → 第二轮属于自动连锁（4 + 1 = 5）。
+	_load_board(gs, PLAYER_CHAIN)
 	gs.score = 0
 	gs.energy = 2
 	_t("E2 tap accepted", gs.tap(2, 0) == true)
-	_eq_int("E2 score 15 + 18", gs.score, 33)
-	_eq_int("E4 one tap costs exactly 1 energy", gs.energy, 3)
+	_eq_int("E2 score 12 (player) + 15 (auto chain)", gs.score, 12 + 15)
+	_eq_int("E4 one tap costs exactly 1 energy across the whole chain", gs.energy, 3)
 	_eq_str("E2 final board after the whole chain", gs.board_text(),
-		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n6 . . . .")
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n5 . . . .")
 	_t("E2 chain ends on a stable board", gs.find_all_regions().is_empty())
 
 	# E5 能量上限
@@ -527,7 +538,8 @@ func _test_chain_and_energy() -> void:
 	_t("E6 tap accepted", gs.tap(0, 2) == true)
 	_eq_int("E6 energy settles back to 1", gs.energy, 1)
 	_eq_int("E6 game continues", gs.phase, GS.Phase.PLAYING)
-	_eq_int("E6 result at bottom of column 0", gs.at(4, 0), 3)
+	# 玩家直接合成：结果保持匹配值 2（不再 +1）
+	_eq_int("E6 player result stays 2 at bottom of column 0", gs.at(4, 0), 2)
 
 
 # ================================================ 点击规则 / 能量 / 复活
@@ -628,8 +640,9 @@ func _test_chain_limit_is_error() -> void:
 	_section("E7 连锁步数上限：不得静默继续，必须进入 ERROR")
 	var gs = GS.new(21)
 	gs.spawn_enabled = false
-	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	gs.max_chain_steps = 1                 # 该场景需要 2 轮
+	# 该夹具确定会产生 2 轮：第一轮玩家直接合成，第二轮自动连锁
+	_load_board(gs, PLAYER_CHAIN)
+	gs.max_chain_steps = 1
 	gs.energy = 3
 	gs.score = 0
 	var accepted: bool = gs.tap(2, 0)
@@ -637,7 +650,18 @@ func _test_chain_limit_is_error() -> void:
 	_eq_int("phase is ERROR", gs.phase, GS.Phase.ERROR)
 	_t("error message recorded", gs.error_message != "", gs.error_message)
 	_t("board is NOT claimed stable", gs.has_unresolved_matches(), gs.board_text())
-	_eq_int("score from completed rounds kept", gs.score, 15)
+	# 第一轮按玩家直接合成的规则已结算完成：结果 4 落在列底，底行 4,4,4 尚未合并
+	_eq_int("score from completed rounds kept", gs.score, 4 * 3)
+	_eq_int("player round result written before the limit", gs.at(4, 0), 4)
+	_eq_int("unresolved row remains", gs.at(4, 1), 4)
+	# 玩家参与标记不得让第二轮的终止性保护失效
+	var merges: Array = []
+	for ev in gs.events:
+		if ev.kind == "merge":
+			merges.append(ev)
+	_eq_int("only the first round resolved", merges.size(), 1)
+	if merges.size() == 1:
+		_t("round 1 was the player merge", merges[0].regions[0].player_merge == true)
 	var frozen: String = gs.board_signature()
 	_t("further taps refused", gs.tap(0, 0) == false)
 	_eq_str("board frozen after ERROR", gs.board_signature(), frozen)
@@ -757,24 +781,26 @@ func _test_animation_events() -> void:
 	var merge_ev = gs.events[1]
 	_eq_int("merge round number", merge_ev["round"], 1)
 	_eq_int("merge board_before is pre-merge", merge_ev.board_before[0], 2)
-	_eq_int("merge board_after holds the result", merge_ev.board_after[0], 3)
+	_eq_int("merge board_after holds the player result (no +1)", merge_ev.board_after[0], 2)
 	_eq_int("merge region count", merge_ev.regions.size(), 1)
 	if merge_ev.regions.size() == 1:
 		_eq_int("region value", merge_ev.regions[0].value, 2)
 		_eq_int("region size", merge_ev.regions[0].size, 3)
 		_eq_int("region target", merge_ev.regions[0].target, 0)
 		_eq_cells("region cells", merge_ev.regions[0].cells, [0, 1, 2])
-		# 用事件重放合并：清空区域 → 在目标写 v+1 → 必须得到 board_after
+		_eq_int("region result_value is written by the kernel", merge_ev.regions[0].result_value, 2)
+		_t("region is flagged as a player merge", merge_ev.regions[0].player_merge == true)
+		# 用事件重放合并：清空区域 → 在目标写 result_value → 必须得到 board_after
 		var replay: PackedInt32Array = merge_ev.board_before.duplicate()
 		for idx in merge_ev.regions[0].cells:
 			replay[idx] = GS.EMPTY
-		replay[merge_ev.regions[0].target] = merge_ev.regions[0].value + 1
+		replay[merge_ev.regions[0].target] = merge_ev.regions[0].result_value
 		_eq_str("merge event replays to board_after", _sig(replay), _sig(merge_ev.board_after))
 
 	var grav_ev = gs.events[2]
 	_eq_int("gravity move count", grav_ev.moves.size(), 1)
 	_eq_int("gravity move lands on the column bottom", grav_ev.moves[0]["to"], 20)
-	_eq_int("gravity move keeps the value", grav_ev.moves[0]["value"], 3)
+	_eq_int("gravity move keeps the player result value", grav_ev.moves[0]["value"], 2)
 	var replay_g: PackedInt32Array = grav_ev.board_before.duplicate()
 	for mv in grav_ev.moves:
 		replay_g[mv["from"]] = GS.EMPTY
@@ -814,9 +840,9 @@ func _test_animation_events() -> void:
 				in_range = false
 		_t("spawn values within {1..5}", in_range)
 
-	# 连锁：每一轮都各自带一组 merge/gravity/refill 事件
+	# 连锁：每一轮都各自带一组 merge/gravity 事件（第一轮玩家直接合成、第二轮自动连锁）
 	gs.spawn_enabled = false
-	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, PLAYER_CHAIN)
 	gs.energy = 3
 	gs.score = 0
 	gs.tap(2, 0)
@@ -824,11 +850,15 @@ func _test_animation_events() -> void:
 	_eq_int("round numbers ascend", gs.events[1]["round"], 1)
 	_eq_int("second merge round number", gs.events[3]["round"], 2)
 	_eq_int("second merge has no gravity move", gs.events[4].moves.size(), 0)
+	_eq_int("round 1 result is the player result", gs.events[1].regions[0].result_value, 4)
+	_eq_int("round 2 result is v + 1", gs.events[3].regions[0].result_value, 5)
+	_t("round 1 flagged as player merge", gs.events[1].regions[0].player_merge == true)
+	_t("round 2 is NOT a player merge", gs.events[3].regions[0].player_merge == false)
 
 	# ERROR 轮次以 error 结尾
 	var gs3 = GS.new(31)
 	gs3.spawn_enabled = false
-	_load_board(gs3, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs3, PLAYER_CHAIN)
 	gs3.max_chain_steps = 1
 	gs3.tap(2, 0)
 	_eq_str("error turn kinds", _event_kinds(gs3), "tap,merge,gravity,error")
@@ -857,7 +887,7 @@ func _test_animation_events() -> void:
 	gs5.energy = 1
 	gs5.score = 0
 	gs5.tap(4, 2)
-	_eq_int("score counted once", gs5.score, (2 + 1) * 3)
+	_eq_int("score counted once (player result 2 * 3)", gs5.score, 2 * 3)
 	_eq_int("energy gained once", gs5.energy, 1)
 	_eq_int("single merge event", _count_kind(gs5, "merge"), 1)
 
@@ -868,3 +898,122 @@ func _count_kind(gs, kind: String) -> int:
 		if ev.kind == kind:
 			n += 1
 	return n
+
+
+# ================================================ 玩家直接合成 vs 自动连锁
+
+func _test_player_merge_rules() -> void:
+	_section("A/B/C/D 玩家直接合成、同轮其他区域、自动连锁、无点击默认语义")
+
+	# ---- A) 玩家直接参与：横排 2 2 1 → 点击第三格 → 结果仍然是 2（不额外加一）
+	var a = GS.new(40)
+	a.spawn_enabled = false
+	_load_board(a, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	a.score = 0
+	a.energy = 5
+	_t("A tap accepted", a.tap(0, 2) == true)
+	_eq_int("A merged number stays 2 (no +1)", a.at(4, 0), 2)
+	_eq_int("A score = result_value * size = 2 * 3", a.score, 6)
+	_eq_int("A energy +1 for the single region", a.energy, 5 - 1 + 1)
+	_eq_int("A exactly one merge round", _count_kind(a, "merge"), 1)
+	_eq_int("A one tile left on the board", a.tile_count(), 1)
+	_eq_str("A final board", a.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n2 . . . .")
+	var a_reg = a.events[1].regions[0]
+	_eq_int("A event value (matched value)", a_reg.value, 2)
+	_eq_int("A event result_value", a_reg.result_value, 2)
+	_eq_int("A event size", a_reg.size, 3)
+	_t("A event player_merge", a_reg.player_merge == true)
+
+	# ---- B) 第一轮两个区域：只有含点击格的那个不加一
+	var b = GS.new(41)
+	b.spawn_enabled = false
+	_load_board(b, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n5 5 5 . .")
+	b.score = 0
+	b.energy = 3                           # 起点低于上限，便于观察"每个区域各回 1 点"
+	_t("B tap accepted", b.tap(0, 2) == true)
+	var b_regs: Array = b.events[1].regions
+	_eq_int("B round 1 has two regions", b_regs.size(), 2)
+	if b_regs.size() == 2:
+		_eq_int("B player region value", b_regs[0].value, 2)
+		_eq_int("B player region result (no +1)", b_regs[0].result_value, 2)
+		_t("B player region flagged", b_regs[0].player_merge == true)
+		_eq_int("B other region value", b_regs[1].value, 5)
+		_eq_int("B other region result (v + 1)", b_regs[1].result_value, 6)
+		_t("B other region not flagged", b_regs[1].player_merge == false)
+		_eq_int("B player region target", b_regs[0].target, 0)
+		_eq_int("B other region target", b_regs[1].target, 20)
+	_eq_int("B score 2*3 + 6*3", b.score, 6 + 18)
+	_eq_int("B energy +2 (one per region)", b.energy, 3 - 1 + 2)
+	_eq_int("B player result after gravity", b.at(3, 0), 2)
+	_eq_int("B chain result after gravity", b.at(4, 0), 6)
+	_eq_int("B two tiles left", b.tile_count(), 2)
+	_eq_int("B no second round", _count_kind(b, "merge"), 1)
+
+	# ---- C) 第一轮之后全部自动加一（直接结算、无点击 → 4 轮连锁）
+	var c = GS.new(42)
+	c.spawn_enabled = false
+	_load_board(c, AUTO_CASCADE)
+	c.score = 0
+	c.energy = 0
+	_eq_int("C cascade resolves STABLE", c.resolve_all(), GS.ResolveResult.STABLE)
+	var c_merges: Array = []
+	for ev in c.events:
+		if ev.kind == "merge":
+			c_merges.append(ev)
+	_eq_int("C four merge rounds", c_merges.size(), 4)
+	var all_auto := true
+	var all_plus_one := true
+	var ascending := true
+	var expected_score := 0
+	for i in c_merges.size():
+		if c_merges[i]["round"] != i + 1:
+			ascending = false
+		for reg in c_merges[i].regions:
+			if reg.player_merge:
+				all_auto = false
+			if reg.result_value != reg.value + 1:
+				all_plus_one = false
+			expected_score += reg.result_value * reg.size
+	_t("C every later round is an automatic merge", all_auto)
+	_t("C every automatic result is v + 1", all_plus_one)
+	_t("C round numbers ascend from 1", ascending)
+	_eq_int("C score equals the sum of result_value * size", c.score, expected_score)
+	_eq_int("C score 9 + 12 + 15 + 18", c.score, 9 + 12 + 15 + 18)
+	_eq_int("C energy from four regions", c.energy, 4)
+	_eq_str("C final board", c.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n6 . . . .")
+
+	# ---- D) 没有玩家点击：直接调用 resolve_all() 时全部按自动合成处理
+	var d = GS.new(43)
+	d.spawn_enabled = false
+	_load_board(d, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n2 2 2 . .")
+	d.score = 0
+	d.energy = 0
+	_eq_int("D resolves STABLE", d.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("D result is v + 1", d.at(4, 0), 3)
+	_eq_int("D score = 3 * 3", d.score, 9)
+	var d_reg = d.events[0].regions[0]
+	_t("D not a player merge", d_reg.player_merge == false)
+	_eq_int("D event result_value", d_reg.result_value, 3)
+
+	# ---- E) 玩家参与判定不得延续到第二轮（即使点击格仍在原坐标）
+	var e = GS.new(44)
+	e.spawn_enabled = false
+	_load_board(e, PLAYER_CHAIN)
+	e.score = 0
+	e.energy = 0
+	e.tap(2, 0)
+	var e_merges: Array = []
+	for ev in e.events:
+		if ev.kind == "merge":
+			e_merges.append(ev)
+	_eq_int("E two merge rounds", e_merges.size(), 2)
+	if e_merges.size() == 2:
+		_t("E round 1 is the player merge", e_merges[0].regions[0].player_merge == true)
+		_eq_int("E round 1 result stays v", e_merges[0].regions[0].result_value, 4)
+		_t("E round 2 is automatic", e_merges[1].regions[0].player_merge == false)
+		_eq_int("E round 2 result is v + 1", e_merges[1].regions[0].result_value, 5)
+	_eq_int("E score 12 + 15", e.score, 27)
+	_eq_int("E final result at column bottom", e.at(4, 0), 5)
+	_eq_int("E only one tile left", e.tile_count(), 1)

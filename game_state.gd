@@ -5,7 +5,11 @@ extends RefCounted
 ##
 ## 规则：
 ##   - 上下左右相邻且数值相同的**非空**方块构成一个连通区域；对角线不算连接，空格不参与
-##   - 连通区域大小 >= MIN_REGION_SIZE(3) 时，整块合并为一个 v+1 的方块
+##   - 连通区域大小 >= MIN_REGION_SIZE(3) 时，整块合并为 1 个方块
+##   - 合并结果数字 result_value 由内核算出：
+##       玩家直接参与的合成（第一轮中、且区域包含本次点击的格子）→ result_value = v（不加一）
+##       其余情况（第一轮的其他区域、第二轮及以后的所有区域、没有点击的直接结算）→ v + 1
+##   - 计分：score += result_value * region_size（与实际写入棋盘的数字自洽）
 ##   - 合并结果初始落在区域"最左上"格（最小行号；同行取最小列号），随后照常参与重力
 ##   - 每轮顺序：快照式检测全部区域 → 统一结算（分数/能量）→ 清空 → 写结果 → 全盘重力
 ##     → 每列顶部空格随机补充 → 重新检测，直到棋盘稳定
@@ -42,6 +46,8 @@ class Region:
 	var size: int = 0
 	var cells: PackedInt32Array = PackedInt32Array()
 	var target: int = -1            # 合并结果的初始位置（最左上格索引）
+	var result_value: int = 0       # 本次合并最终写入棋盘的数字（由内核唯一决定）
+	var player_merge: bool = false  # 是否由玩家本次点击直接参与（仅第一轮可能为 true）
 
 
 # ------------------------------------------------------ 可配置项（默认 = 规则值）
@@ -80,6 +86,9 @@ var rng: RandomNumberGenerator = RandomNumberGenerator.new()
 var _seed: int = 0
 var _init_nodes: int = 0
 var _round: int = 0
+## 本次点击所改变的格子索引；-1 表示没有玩家点击（直接调用 resolve_all 时的默认语义）。
+## 只在第一轮用于玩家参与判定，new_game() 会清除，避免跨局残留。
+var _player_index: int = -1
 # 初始化用的工作棋盘（成员变量，避免 Packed 数组传参语义带来的歧义）
 var _work: PackedInt32Array = PackedInt32Array()
 # 洪泛用的 scratch（同样放在成员上，保证写入一定生效）
@@ -112,6 +121,7 @@ func new_game() -> void:
 	last_gravity_moves = []
 	last_refill_spawns = []
 	_round = 0
+	_player_index = -1
 	if _build_initial_board():
 		phase = Phase.PLAYING
 	else:
@@ -222,7 +232,7 @@ func tap(r: int, c: int) -> bool:
 		"board_after": board.duplicate(),
 	})
 
-	if resolve_all() == ResolveResult.CHAIN_LIMIT_EXCEEDED:
+	if resolve_all(idx) == ResolveResult.CHAIN_LIMIT_EXCEEDED:
 		events.append({"kind": "error", "message": error_message, "board": board.duplicate()})
 		return false                       # phase 已进入 ERROR
 
@@ -231,10 +241,13 @@ func tap(r: int, c: int) -> bool:
 	return true
 
 ## 反复结算直到棋盘稳定。返回 ResolveResult。
+## p_player_index = 本次点击所改变的格子索引；-1 表示没有玩家点击（全部按自动合成处理）。
+## 玩家参与判定只在第一轮生效，第二轮及以后一律视为自动连锁。
 ## 超过 max_chain_steps 时进入 ERROR（不静默继续、也不假装已正常结算）。
-func resolve_all() -> int:
+func resolve_all(p_player_index: int = -1) -> int:
 	if phase == Phase.ERROR:
 		return ResolveResult.BLOCKED_ERROR     # ERROR 状态是黏性的
+	_player_index = p_player_index
 	var steps := 0
 	while true:
 		var regions := find_all_regions()
@@ -254,9 +267,13 @@ func resolve_all() -> int:
 func _resolve_round(regions: Array, round_no: int) -> void:
 	var board_before_merge := board.duplicate()
 
-	# ① 分数与能量：每个连通区域各结算一次（区域之间互不重叠，天然不会重复计分）
+	# ① 先为每个区域定出结果数字与玩家参与标记，再据此结算分数与能量
+	#    （区域之间互不重叠，天然不会重复计分；每个区域只结算一次）
 	for reg in regions:
-		score += (reg.value + 1) * reg.size
+		# 玩家直接参与：仅限第一轮，且该区域包含本次点击所改变的格子
+		reg.player_merge = (round_no == 1) and _player_index >= 0 and reg.cells.has(_player_index)
+		reg.result_value = reg.value if reg.player_merge else reg.value + 1
+		score += reg.result_value * reg.size
 		energy += 1
 		if energy > ENERGY_MAX:
 			energy = ENERGY_MAX
@@ -266,9 +283,9 @@ func _resolve_round(regions: Array, round_no: int) -> void:
 		for idx in reg.cells:
 			board[idx] = EMPTY
 
-	# ③ 在各自的合并目标位置写入 v + 1
+	# ③ 在各自的合并目标位置写入内核算好的 result_value（不再使用固定 value + 1）
 	for reg in regions:
-		board[reg.target] = reg.value + 1
+		board[reg.target] = reg.result_value
 
 	var region_data: Array = []
 	for reg in regions:
@@ -277,6 +294,8 @@ func _resolve_round(regions: Array, round_no: int) -> void:
 			"size": reg.size,
 			"cells": reg.cells.duplicate(),
 			"target": reg.target,
+			"result_value": reg.result_value,
+			"player_merge": reg.player_merge,
 		})
 	events.append({
 		"kind": "merge",
