@@ -44,6 +44,11 @@ func set_value(p_value: int) -> void:
 	_update_font_size()
 
 
+## 动画期间隐藏 / 恢复该静态格子（避免与覆盖层里的移动方块同时出现）。
+func set_ghosted(hidden: bool) -> void:
+	modulate.a = 0.0 if hidden else 1.0
+
+
 func _on_pressed() -> void:
 	tile_clicked.emit(row, col)
 

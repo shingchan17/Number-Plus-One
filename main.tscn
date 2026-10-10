@@ -1,7 +1,8 @@
-[gd_scene load_steps=3 format=3]
+[gd_scene load_steps=4 format=3]
 
 [ext_resource type="Script" path="res://main.gd" id="1_main"]
 [ext_resource type="Script" path="res://board.gd" id="2_board"]
+[ext_resource type="Script" path="res://anim_layer.gd" id="3_anim"]
 
 [node name="Main" type="Control"]
 layout_mode = 3
@@ -55,12 +56,30 @@ layout_mode = 2
 size_flags_vertical = 3
 ratio = 1.0
 
-[node name="Board" type="GridContainer" parent="Root/Layout/BoardWrapper"]
+[node name="BoardStack" type="Control" parent="Root/Layout/BoardWrapper"]
 layout_mode = 2
+
+[node name="Board" type="GridContainer" parent="Root/Layout/BoardWrapper/BoardStack"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
 theme_override_constants/h_separation = 6
 theme_override_constants/v_separation = 6
 columns = 5
 script = ExtResource("2_board")
+
+[node name="AnimLayer" type="Control" parent="Root/Layout/BoardWrapper/BoardStack"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("3_anim")
 
 [node name="BottomBar" type="VBoxContainer" parent="Root/Layout"]
 layout_mode = 2

@@ -66,11 +66,20 @@ var error_message: String = ""
 ## 顶部补充统计：顶部空格补充尝试次数 / 实际生成的方块数（供测试与调试观察）。
 var spawn_attempts: int = 0
 var spawns_done: int = 0
+## 最近一次 tap() 产生的【有序动画事件】。UI 只播放这些事件，不重新计算规则。
+## 顺序：tap → (merge → gravity → refill) × N → settled；连锁异常时以 error 结尾。
+## 记录事件不会额外消耗随机数、不改变随机数顺序、不重复结算分数或能量。
+var events: Array = []
+## 最近一次 apply_gravity() 中需要移动的方块：{from, to, value}
+var last_gravity_moves: Array = []
+## 最近一次 refill_tops() 生成的方块：{index, value}
+var last_refill_spawns: Array = []
 ## 本类唯一的随机源。顶部补充的数字都从这里取。
 var rng: RandomNumberGenerator = RandomNumberGenerator.new()
 
 var _seed: int = 0
 var _init_nodes: int = 0
+var _round: int = 0
 # 初始化用的工作棋盘（成员变量，避免 Packed 数组传参语义带来的歧义）
 var _work: PackedInt32Array = PackedInt32Array()
 # 洪泛用的 scratch（同样放在成员上，保证写入一定生效）
@@ -99,6 +108,10 @@ func new_game() -> void:
 	spawn_attempts = 0
 	spawns_done = 0
 	error_message = ""
+	events = []
+	last_gravity_moves = []
+	last_refill_spawns = []
+	_round = 0
 	if _build_initial_board():
 		phase = Phase.PLAYING
 	else:
@@ -187,6 +200,7 @@ func _work_enqueue(idx: int, v: int, seen: Dictionary, queue: Array) -> void:
 
 ## 玩家点击一格。返回 true 表示这次点击被接受（不代表一定发生了合并）。
 func tap(r: int, c: int) -> bool:
+	events = []                            # 被拒绝的点击不会残留上一轮的事件
 	if phase != Phase.PLAYING:
 		return false
 	if not in_bounds(r, c):
@@ -195,15 +209,26 @@ func tap(r: int, c: int) -> bool:
 	if board[idx] == EMPTY:
 		return false                       # 空格不可点击，不消耗能量
 
+	var before := board.duplicate()
 	energy -= 1                            # 一次点击只扣 1 点，无论之后多少轮连锁
 	board[idx] += 1
 
+	_round = 0
+	events.append({
+		"kind": "tap",
+		"index": idx,
+		"value": board[idx],
+		"board_before": before,
+		"board_after": board.duplicate(),
+	})
+
 	if resolve_all() == ResolveResult.CHAIN_LIMIT_EXCEEDED:
+		events.append({"kind": "error", "message": error_message, "board": board.duplicate()})
 		return false                       # phase 已进入 ERROR
 
 	_settle_after_turn()
+	events.append({"kind": "settled", "board": board.duplicate()})
 	return true
-
 
 ## 反复结算直到棋盘稳定。返回 ResolveResult。
 ## 超过 max_chain_steps 时进入 ERROR（不静默继续、也不假装已正常结算）。
@@ -219,12 +244,16 @@ func resolve_all() -> int:
 		if steps > max_chain_steps:
 			_fail("chain step limit exceeded: %d round(s) resolved, %d region(s) left unresolved" % [steps - 1, regions.size()])
 			return ResolveResult.CHAIN_LIMIT_EXCEEDED
-		_resolve_round(regions)
+		_round += 1
+		_resolve_round(regions, _round)
 	return ResolveResult.STABLE
 
 
 ## 结算一轮：基于同一份快照完成 分数/能量 → 清空 → 写结果 → 重力 → 顶部补充。
-func _resolve_round(regions: Array) -> void:
+## 同时把这一轮的三个可播放阶段（merge / gravity / refill）记入 events。
+func _resolve_round(regions: Array, round_no: int) -> void:
+	var board_before_merge := board.duplicate()
+
 	# ① 分数与能量：每个连通区域各结算一次（区域之间互不重叠，天然不会重复计分）
 	for reg in regions:
 		score += (reg.value + 1) * reg.size
@@ -241,44 +270,91 @@ func _resolve_round(regions: Array) -> void:
 	for reg in regions:
 		board[reg.target] = reg.value + 1
 
+	var region_data: Array = []
+	for reg in regions:
+		region_data.append({
+			"value": reg.value,
+			"size": reg.size,
+			"cells": reg.cells.duplicate(),
+			"target": reg.target,
+		})
+	events.append({
+		"kind": "merge",
+		"round": round_no,
+		"regions": region_data,
+		"board_before": board_before_merge,
+		"board_after": board.duplicate(),
+	})
+
 	# ④ 全盘重力：所有保留方块（含本轮结果）按列下落
+	var board_before_gravity := board.duplicate()
 	apply_gravity()
+	events.append({
+		"kind": "gravity",
+		"round": round_no,
+		"moves": last_gravity_moves.duplicate(),
+		"board_before": board_before_gravity,
+		"board_after": board.duplicate(),
+	})
 
 	# ⑤ 每列顶部空格补充随机方块
 	if spawn_enabled:
+		var board_before_refill := board.duplicate()
 		refill_tops()
+		events.append({
+			"kind": "refill",
+			"round": round_no,
+			"spawns": last_refill_spawns.duplicate(),
+			"board_before": board_before_refill,
+			"board_after": board.duplicate(),
+		})
 
 
 ## 全盘重力：每列独立处理。保留非空方块的原有上下顺序，把它们压到该列底部。
 ## 不做任何左右移动，也不交换同列内方块的相对顺序。
+## 需要移动的方块记入 last_gravity_moves（{from, to, value}），供动画逐块播放。
 func apply_gravity() -> void:
+	last_gravity_moves = []
 	for c in BOARD_N:
-		var write_row := BOARD_N - 1
-		for r in range(BOARD_N - 1, -1, -1):
+		var values := PackedInt32Array()
+		var from_rows := PackedInt32Array()
+		for r in BOARD_N:
 			var v := board[r * BOARD_N + c]
-			if v == EMPTY:
-				continue
-			if write_row != r:
-				board[write_row * BOARD_N + c] = v
-				board[r * BOARD_N + c] = EMPTY
-			write_row -= 1
-		while write_row >= 0:
-			board[write_row * BOARD_N + c] = EMPTY
-			write_row -= 1
+			if v != EMPTY:
+				values.append(v)
+				from_rows.append(r)
+		var n := values.size()
+		var top_row := BOARD_N - n                  # 压实后最上面一行的行号
+		for i in n:
+			var to_row := top_row + i
+			if from_rows[i] != to_row:
+				last_gravity_moves.append({
+					"from": from_rows[i] * BOARD_N + c,
+					"to": to_row * BOARD_N + c,
+					"value": values[i],
+				})
+		for r in BOARD_N:
+			board[r * BOARD_N + c] = EMPTY
+		for i in n:
+			board[(top_row + i) * BOARD_N + c] = values[i]
 
 
 ## 每列顶部的连续空格各生成一个新方块，取值 {SPAWN_MIN..SPAWN_MAX} 等概率。
 ## 抽取顺序固定为：列从左到右、同列自上而下 —— 保证固定 seed 完全可复现。
+## 每个空格只抽取一次随机数，生成结果记入 last_refill_spawns（{index, value}）。
 ## 返回本次生成的方块数量。
 func refill_tops() -> int:
 	var added := 0
+	last_refill_spawns = []
 	for c in BOARD_N:
 		for r in BOARD_N:
 			if board[r * BOARD_N + c] != EMPTY:
 				break                  # 该列顶部连续空格到此为止
 			spawn_attempts += 1
-			board[r * BOARD_N + c] = rng.randi_range(SPAWN_MIN, SPAWN_MAX)
+			var value := rng.randi_range(SPAWN_MIN, SPAWN_MAX)
+			board[r * BOARD_N + c] = value
 			spawns_done += 1
+			last_refill_spawns.append({"index": r * BOARD_N + c, "value": value})
 			added += 1
 	return added
 

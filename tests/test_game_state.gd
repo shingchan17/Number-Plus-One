@@ -38,6 +38,7 @@ func _initialize() -> void:
 	_test_revive()
 	_test_chain_limit_is_error()
 	_test_determinism()
+	_test_animation_events()
 	_test_score_store()
 	_finish()
 
@@ -707,3 +708,163 @@ func _remove_test_save() -> void:
 	var dir := DirAccess.open("user://")
 	if dir != null and dir.file_exists(TEST_SAVE_PATH.get_file()):
 		dir.remove(TEST_SAVE_PATH.get_file())
+
+
+# ================================================ P2 动画事件序列
+
+func _event_kinds(gs) -> String:
+	var parts := PackedStringArray()
+	for ev in gs.events:
+		parts.append(str(ev.kind))
+	return ",".join(parts)
+
+
+func _sig(values: PackedInt32Array) -> String:
+	var parts := PackedStringArray()
+	for v in values:
+		parts.append(str(v))
+	return ",".join(parts)
+
+
+func _test_animation_events() -> void:
+	_section("P2 事件序列：tap → (merge → gravity → refill) × N → settled")
+	var gs = GS.new(30)
+	gs.spawn_enabled = false
+
+	# 无合并的点击：只有 tap + settled
+	_load_board(gs, SINGLE_TILE)
+	gs.energy = 5
+	gs.score = 0
+	gs.tap(0, 0)
+	_eq_int("plain click records 2 events", gs.events.size(), 2)
+	_eq_str("plain click kinds", _event_kinds(gs), "tap,settled")
+	_eq_int("tap event value", gs.events[0].value, 6)
+	_eq_int("tap board_before is the pre-click board", gs.events[0].board_before[0], 5)
+	_eq_int("tap board_after applies +1", gs.events[0].board_after[0], 6)
+	_eq_str("settled board equals final board", _sig(gs.events[1].board), gs.board_signature())
+
+	# 被拒绝的点击不残留上一轮事件（UI 据此避免重放）
+	gs.tap(0, 1)
+	_eq_int("refused tap clears events", gs.events.size(), 0)
+
+	# 恰好一轮合并 + 重力（水平三连合成后，结果落到列底，之后棋盘稳定）
+	_load_board(gs, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.energy = 3
+	gs.score = 0
+	gs.tap(0, 2)
+	_eq_str("one round kinds", _event_kinds(gs), "tap,merge,gravity,settled")
+
+	var merge_ev = gs.events[1]
+	_eq_int("merge round number", merge_ev["round"], 1)
+	_eq_int("merge board_before is pre-merge", merge_ev.board_before[0], 2)
+	_eq_int("merge board_after holds the result", merge_ev.board_after[0], 3)
+	_eq_int("merge region count", merge_ev.regions.size(), 1)
+	if merge_ev.regions.size() == 1:
+		_eq_int("region value", merge_ev.regions[0].value, 2)
+		_eq_int("region size", merge_ev.regions[0].size, 3)
+		_eq_int("region target", merge_ev.regions[0].target, 0)
+		_eq_cells("region cells", merge_ev.regions[0].cells, [0, 1, 2])
+		# 用事件重放合并：清空区域 → 在目标写 v+1 → 必须得到 board_after
+		var replay: PackedInt32Array = merge_ev.board_before.duplicate()
+		for idx in merge_ev.regions[0].cells:
+			replay[idx] = GS.EMPTY
+		replay[merge_ev.regions[0].target] = merge_ev.regions[0].value + 1
+		_eq_str("merge event replays to board_after", _sig(replay), _sig(merge_ev.board_after))
+
+	var grav_ev = gs.events[2]
+	_eq_int("gravity move count", grav_ev.moves.size(), 1)
+	_eq_int("gravity move lands on the column bottom", grav_ev.moves[0]["to"], 20)
+	_eq_int("gravity move keeps the value", grav_ev.moves[0]["value"], 3)
+	var replay_g: PackedInt32Array = grav_ev.board_before.duplicate()
+	for mv in grav_ev.moves:
+		replay_g[mv["from"]] = GS.EMPTY
+	for mv in grav_ev.moves:
+		replay_g[mv["to"]] = mv["value"]
+	_eq_str("gravity moves replay to board_after", _sig(replay_g), _sig(grav_ev.board_after))
+	_eq_str("gravity board_after equals kernel board", _sig(grav_ev.board_after), gs.board_signature())
+
+	# 关闭补充时轮次里不应出现 refill 事件
+	_eq_int("no refill event when refill disabled", 0, _count_kind(gs, "refill"))
+
+	# 开启补充：refill 事件必须能重放出 board_after
+	gs.spawn_enabled = true
+	_load_board(gs, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.energy = 5
+	gs.score = 0
+	gs.tap(0, 2)
+	var refill_ev = null
+	for ev in gs.events:
+		if ev.kind == "refill":
+			refill_ev = ev
+			break
+	_t("refill event recorded", refill_ev != null, _event_kinds(gs))
+	if refill_ev != null:
+		var replay_r: PackedInt32Array = refill_ev.board_before.duplicate()
+		for sp in refill_ev.spawns:
+			replay_r[sp["index"]] = sp["value"]
+		_eq_str("refill spawns replay to board_after", _sig(replay_r), _sig(refill_ev.board_after))
+		var holes_before := 0
+		for v in refill_ev.board_before:
+			if v == GS.EMPTY:
+				holes_before += 1
+		_eq_int("one spawn per empty cell", refill_ev.spawns.size(), holes_before)
+		var in_range := true
+		for sp in refill_ev.spawns:
+			if sp["value"] < GS.SPAWN_MIN or sp["value"] > GS.SPAWN_MAX:
+				in_range = false
+		_t("spawn values within {1..5}", in_range)
+
+	# 连锁：每一轮都各自带一组 merge/gravity/refill 事件
+	gs.spawn_enabled = false
+	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.energy = 3
+	gs.score = 0
+	gs.tap(2, 0)
+	_eq_str("two rounds kinds", _event_kinds(gs), "tap,merge,gravity,merge,gravity,settled")
+	_eq_int("round numbers ascend", gs.events[1]["round"], 1)
+	_eq_int("second merge round number", gs.events[3]["round"], 2)
+	_eq_int("second merge has no gravity move", gs.events[4].moves.size(), 0)
+
+	# ERROR 轮次以 error 结尾
+	var gs3 = GS.new(31)
+	gs3.spawn_enabled = false
+	_load_board(gs3, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs3.max_chain_steps = 1
+	gs3.tap(2, 0)
+	_eq_str("error turn kinds", _event_kinds(gs3), "tap,merge,gravity,error")
+	_eq_int("error turn phase", gs3.phase, GS.Phase.ERROR)
+
+	# 记录事件不改变随机数消费顺序：用独立 RNG 复算补充数值
+	var gs4 = GS.new(32)
+	gs4.spawn_enabled = true
+	_load_board(gs4, EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs4.apply_gravity()
+	gs4.rng.seed = 555
+	gs4.refill_tops()
+	var probe := RandomNumberGenerator.new()
+	probe.seed = 555
+	var order_ok := true
+	for sp in gs4.last_refill_spawns:
+		if sp["value"] != probe.randi_range(GS.SPAWN_MIN, GS.SPAWN_MAX):
+			order_ok = false
+	_eq_int("20 top holes filled", gs4.last_refill_spawns.size(), 20)
+	_t("exactly one rng draw per hole, column-major order", order_ok)
+
+	# 记录事件不重复计分 / 不重复回能
+	var gs5 = GS.new(33)
+	gs5.spawn_enabled = false
+	_load_board(gs5, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n2 2 1 . .")
+	gs5.energy = 1
+	gs5.score = 0
+	gs5.tap(4, 2)
+	_eq_int("score counted once", gs5.score, (2 + 1) * 3)
+	_eq_int("energy gained once", gs5.energy, 1)
+	_eq_int("single merge event", _count_kind(gs5, "merge"), 1)
+
+
+func _count_kind(gs, kind: String) -> int:
+	var n := 0
+	for ev in gs.events:
+		if ev.kind == kind:
+			n += 1
+	return n
