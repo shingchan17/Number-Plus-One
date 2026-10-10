@@ -241,17 +241,19 @@ func _test_empty_tile_rejected() -> void:
 
 
 func _test_chain_shows_final_board() -> void:
-	_section("连锁：界面显示结算完成后的最终棋盘")
+	_section("连锁：界面显示结算完成后的最终棋盘（含重力下落）")
 	_load_fixture("4 5 5 . .\n4 . . . .\n3 . . . .\n. . . . .\n. . . . .", 2, 0, 1)
 	main.board.tile_at(2, 0).pressed.emit()
 	await process_frame
 
-	_eq_int("kernel board (0,0)", main.state.board[0], 6)
+	# 新规则：纵列 4,4,4 → 合成 5 → 重力把 row0 的三个 5 压到底行 → 底行 5,5,5 → 再合成 6
+	# 结果最终落在 (4,0)，即索引 20
+	_eq_int("kernel board (4,0)", main.state.board[20], 6)
 	_eq_int("kernel score +33", main.state.score, 33)
 	_eq_int("kernel energy 2-1+2", main.state.energy, 3)
 	_t("kernel board is stable", main.state.has_unresolved_matches() == false, main.state.board_text())
-	_eq_int("tile (0,0) shows 6", main.board.tile_at(0, 0).value, 6)
-	_eq_str("tile (0,0) text", main.board.tile_at(0, 0).text, "6")
+	_eq_int("tile (4,0) shows 6", main.board.tile_at(4, 0).value, 6)
+	_eq_str("tile (4,0) text", main.board.tile_at(4, 0).text, "6")
 	var leftovers := 0
 	for i in GS.CELL_COUNT:
 		if main.state.board[i] != GS.EMPTY:

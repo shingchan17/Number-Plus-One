@@ -1,19 +1,22 @@
 extends SceneTree
 
-## P0 纯逻辑内核的 headless 自动化测试。
+## P0.5 逻辑内核测试：连通区域合并 + 重力下落 + 顶部随机补充。
 ##
 ## 运行方式：
 ##   godot --headless --path <项目目录> --script res://tests/test_game_state.gd
 ## 退出码 0 = 全部通过；1 = 存在失败断言。
 ##
-## 所有随机行为都通过固定 seed 或可控随机输入构造，不存在"多跑几次碰巧通过"。
+## 约定：需要精确断言棋盘时把 spawn_enabled 关掉（不做顶部补充），
+## 这样"合并 → 重力"的结果是唯一确定的；顶部补充与连锁另用固定 seed 验证。
 
 const GS = preload("res://game_state.gd")
 const SS = preload("res://score_store.gd")
 
 const TEST_SAVE_PATH := "user://test_highscore.cfg"
 const EMPTY_ROW := ". . . . ."
-const CHECKERBOARD := "1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1"
+const SINGLE_TILE := "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW
+# 无任何 >=3 连通区域的满盘（横向成对，纵向交替）
+const PAIRS_BOARD := "2 2 1 1 2\n1 1 2 2 1\n2 2 1 1 2\n1 1 2 2 1\n2 2 1 1 2"
 
 var _passed := 0
 var _failed := 0
@@ -23,23 +26,20 @@ var _current := ""
 func _initialize() -> void:
 	_test_initial_board()
 	_test_initial_board_failure()
-	_test_basic_merges()
-	_test_cross_matches()
-	_test_chain()
-	_test_dense_block()
+	_test_region_detection()
+	_test_merge_and_target()
+	_test_multi_region_round()
+	_test_gravity()
+	_test_top_refill()
+	_test_chain_by_refill()
+	_test_chain_and_energy()
 	_test_tap_rules()
 	_test_energy_and_game_over()
 	_test_revive()
 	_test_chain_limit_is_error()
-	_test_spawn_basics()
-	_test_spawn_value_range()
-	_test_spawn_reproducibility()
-	_test_spawn_participates_in_chain()
+	_test_determinism()
 	_test_score_store()
-	print("")
-	print("checks passed: %d, failed: %d" % [_passed, _failed])
-	print("RESULT=", "PASS" if _failed == 0 else "FAIL")
-	quit(0 if _failed == 0 else 1)
+	_finish()
 
 
 # ==================================================================== 断言工具
@@ -65,6 +65,16 @@ func _eq_str(label: String, actual: String, expected: String) -> void:
 	_t(label, actual == expected, "expected:\n%s\ngot:\n%s" % [expected, actual])
 
 
+func _eq_cells(label: String, cells: PackedInt32Array, expected: Array) -> void:
+	var got := PackedStringArray()
+	for v in cells:
+		got.append(str(v))
+	var want := PackedStringArray()
+	for v in expected:
+		want.append(str(v))
+	_eq_str(label, ",".join(got), ",".join(want))
+
+
 func _load_board(gs, text: String) -> void:
 	_t("board fixture loads", gs.set_board_from_text(text), "fixture:\n" + text)
 
@@ -78,18 +88,29 @@ func _all_cells_between(gs, lo: int, hi: int) -> bool:
 	return true
 
 
-# ============================================================ T01/T02/T25 初始化
+func _count_empty(gs) -> int:
+	return GS.CELL_COUNT - gs.tile_count()
+
+
+func _finish() -> void:
+	print("")
+	print("checks passed: %d, failed: %d" % [_passed, _failed])
+	print("RESULT=", "PASS" if _failed == 0 else "FAIL")
+	quit(0 if _failed == 0 else 1)
+
+
+# ================================================ F2 / 初始化
 
 func _test_initial_board() -> void:
-	_section("T01/T02/T25 开局棋盘：填满、无匹配、可复现")
+	_section("F2/T01/T02 开局棋盘：满盘、只用 {1,2}、无 >=3 连通区域、可复现")
 
 	var seeds := [0, 1, 2, 7, 42, 999, 12345, 20261009]
 	for s in seeds:
 		var gs = GS.new(s)
 		_eq_int("seed %d board size" % s, gs.board.size(), GS.CELL_COUNT)
 		_t("seed %d all cells in {1,2}" % s, _all_cells_between(gs, GS.INIT_MIN, GS.INIT_MAX), gs.board_text())
-		_t("seed %d tile count == 25" % s, gs.tile_count() == GS.CELL_COUNT, gs.board_text())
-		_t("seed %d has no match at start" % s, gs.find_all_segments().is_empty(), gs.board_text())
+		_eq_int("seed %d is completely filled" % s, gs.tile_count(), GS.CELL_COUNT)
+		_t("seed %d has no mergeable region" % s, gs.find_all_regions().is_empty(), gs.board_text())
 		_eq_int("seed %d starts PLAYING" % s, gs.phase, GS.Phase.PLAYING)
 		_eq_int("seed %d starts energy 5" % s, gs.energy, GS.ENERGY_START)
 		_eq_int("seed %d starts score 0" % s, gs.score, 0)
@@ -103,9 +124,11 @@ func _test_initial_board() -> void:
 		var g = GS.new(s)
 		if g.board.size() != GS.CELL_COUNT or not _all_cells_between(g, GS.INIT_MIN, GS.INIT_MAX):
 			bad += 1
-		elif not g.find_all_segments().is_empty():
+		elif g.tile_count() != GS.CELL_COUNT:
 			bad += 1
-	_eq_int("200 seeds all give full match-free boards", bad, 0)
+		elif not g.find_all_regions().is_empty():
+			bad += 1
+	_eq_int("200 seeds all give full boards without mergeable regions", bad, 0)
 
 	var sigs := {}
 	for s in seeds:
@@ -114,9 +137,9 @@ func _test_initial_board() -> void:
 
 
 func _test_initial_board_failure() -> void:
-	_section("T03 初始化无解时必须显式失败，绝不返回含匹配段的棋盘")
+	_section("T03 初始化无解时必须显式失败，绝不返回含可合并区域的棋盘")
 
-	# 只允许填 1 → 5x5 必然出现三连 → 无解，必须回溯到穷尽并失败
+	# 只允许填 1 → 整盘 25 个 1 必然连通 → 无解
 	var gs = GS.new(5)
 	gs.init_candidates = PackedInt32Array([1])
 	gs.new_game()
@@ -126,154 +149,400 @@ func _test_initial_board_failure() -> void:
 	_t("tap refused while ERROR", gs.tap(0, 0) == false)
 	_eq_int("board unchanged after refused tap", gs.tile_count(), 0)
 
-	# 候选集合为空也必须失败
 	var gs2 = GS.new(5)
 	gs2.init_candidates = PackedInt32Array()
 	gs2.new_game()
 	_eq_int("empty candidate list → ERROR", gs2.phase, GS.Phase.ERROR)
 
-	# 搜索节点上限也必须失败（防御性）
 	var gs3 = GS.new(5)
 	gs3.init_node_limit = 0
 	gs3.new_game()
 	_eq_int("node limit 0 → ERROR", gs3.phase, GS.Phase.ERROR)
 
 
-# ============================================== A/B/C/D/G/H 基础消除
+# ================================================ A. 连通区域检测
 
-func _test_basic_merges() -> void:
-	_section("A/B/C/D/G/H 三连、四连、五连、纵向、打断、不同数字")
-
-	var gs = GS.new(11)
+func _test_region_detection() -> void:
+	_section("A 连通区域检测（4 邻接、同值、非空）")
+	var gs = GS.new(10)
 	gs.spawn_enabled = false
+
+	# A1 横向 3
 	_load_board(gs, "2 2 2 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	var r: Array = gs.find_all_regions()
+	_eq_int("A1 one region", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A1 value", r[0].value, 2)
+		_eq_int("A1 size", r[0].size, 3)
+		_eq_int("A1 target index", r[0].target, 0)
+		_eq_cells("A1 cells", r[0].cells, [0, 1, 2])
+
+	# A2 纵向 3
+	_load_board(gs, ". . 5 . .\n. . 5 . .\n. . 5 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	r = gs.find_all_regions()
+	_eq_int("A2 one region", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A2 size", r[0].size, 3)
+		_eq_int("A2 target is the topmost cell", r[0].target, 2)
+		_eq_cells("A2 cells", r[0].cells, [2, 7, 12])
+
+	# A3 L 形 3
+	_load_board(gs, "2 . . . .\n2 2 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	r = gs.find_all_regions()
+	_eq_int("A3 L shape is one region", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A3 size", r[0].size, 3)
+		_eq_cells("A3 cells", r[0].cells, [0, 5, 6])
+
+	# A4 T 形 4
+	_load_board(gs, ". 3 . . .\n3 3 3 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	r = gs.find_all_regions()
+	_eq_int("A4 T shape is one region", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A4 size", r[0].size, 4)
+		_eq_cells("A4 cells", r[0].cells, [1, 5, 6, 7])
+
+	# A5 十字 5
+	_load_board(gs, ". 4 . . .\n4 4 4 . .\n. 4 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	r = gs.find_all_regions()
+	_eq_int("A5 cross is ONE region (not three lines)", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A5 size", r[0].size, 5)
+		_eq_cells("A5 cells", r[0].cells, [1, 5, 6, 7, 11])
+	var total := 0
+	for reg in r:
+		total += reg.size
+	_eq_int("A5 total cells counted once", total, 5)
+
+	# A6 直线 5 个只算一个区域
+	_load_board(gs, "1 1 1 1 1\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	r = gs.find_all_regions()
+	_eq_int("A6 straight 5 is one region", r.size(), 1)
+	if r.size() == 1:
+		_eq_int("A6 size", r[0].size, 5)
+		_eq_int("A6 target", r[0].target, 0)
+
+	# A7 空格阻断
+	_load_board(gs, "2 2 . 2 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_eq_int("A7 gap breaks connectivity", gs.find_all_regions().size(), 0)
+
+	# A8 不同数字阻断
+	_load_board(gs, "2 2 3 2 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_eq_int("A8 different values break connectivity", gs.find_all_regions().size(), 0)
+
+	# A9 仅对角线连接不算
+	_load_board(gs, "2 . . . .\n. 2 . . .\n. . 2 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_eq_int("A9 diagonal is not connected", gs.find_all_regions().size(), 0)
+
+	# A10 没有 >=3 的区域就不触发合并
+	_load_board(gs, PAIRS_BOARD)
+	_eq_int("A10 no region on pair board", gs.find_all_regions().size(), 0)
 	gs.score = 0
 	gs.energy = 3
-	_eq_int("A single segment found", gs.find_all_segments().size(), 1)
-	_eq_int("A resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("A board", gs.board_text(), "3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("A score +9", gs.score, 9)
-	_eq_int("A energy +1", gs.energy, 4)
+	_eq_int("A10 resolve is STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_str("A10 board untouched", gs.board_text(), PAIRS_BOARD)
+	_eq_int("A10 score untouched", gs.score, 0)
+	_eq_int("A10 energy untouched", gs.energy, 3)
 
-	_load_board(gs, "1 1 1 1 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+
+# ================================================ B. 合并与位置
+
+func _test_merge_and_target() -> void:
+	_section("B 合并阈值、结果落点与得分")
+	var gs = GS.new(11)
+	gs.spawn_enabled = false
+
+	# B1 三个 2 → 一个 3，得分 +9
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n2 2 2 . .")
 	gs.score = 0
 	gs.energy = 0
-	_eq_int("B one maximal segment", gs.find_all_segments().size(), 1)
-	_eq_int("B resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("B board", gs.board_text(), "2 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("B score +8", gs.score, 8)
+	_eq_int("B1 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B1 score +9", gs.score, 9)
+	_eq_int("B1 energy +1", gs.energy, 1)
+	_eq_str("B1 result 3 at leftmost cell of the row", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n3 . . . .")
 
-	_load_board(gs, "3 3 3 3 3\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	# B2 四个 3 → 一个 4，得分 +16（不拆成 3+1）
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n3 3 3 3 .")
 	gs.score = 0
-	_eq_int("C resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("C board", gs.board_text(), "4 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("C score +20", gs.score, 20)
+	_eq_int("B2 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B2 score +16", gs.score, 16)
+	_eq_str("B2 one tile of 4", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n4 . . . .")
 
-	# D：纵向三连，结果落在最上格
-	_load_board(gs, ". . 5 . .\n. . 5 . .\n. . 5 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	# B3 五个 4 → 一个 5，得分 +25
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n4 4 4 4 4")
 	gs.score = 0
-	_eq_int("D resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("D board", gs.board_text(), ". . 6 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("D score +18", gs.score, 18)
+	_eq_int("B3 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B3 score +25", gs.score, 25)
+	_eq_str("B3 one tile of 5", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n5 . . . .")
 
-	# G：空格打断连续
-	_load_board(gs, "2 . 2 2 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	# B4 落点 = 最左上格（用"顶端优先"与"最左列优先"可区分的形状）
+	#    cells = (0,2) (1,1) (1,2)：最上行是 row 0 → 取 (0,2)，而不是最左列 (1,1)
+	_load_board(gs, ". . 7 . .\n. 7 7 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	var regs: Array = gs.find_all_regions()
+	_eq_int("B4 one region", regs.size(), 1)
+	if regs.size() == 1:
+		_eq_int("B4 target is topmost-then-leftmost", regs[0].target, 2)
 	gs.score = 0
-	gs.energy = 2
-	_eq_int("G no segment (gap breaks run)", gs.find_all_segments().size(), 0)
-	_eq_int("G resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("G board unchanged", gs.board_text(), "2 . 2 2 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("G score unchanged", gs.score, 0)
-	_eq_int("G energy unchanged", gs.energy, 2)
+	_eq_int("B4 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B4 score (7+1)*3", gs.score, 24)
+	_eq_str("B4 result fell to the bottom of column 2", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n. . 8 . .")
 
-	# H：不同数字不构成匹配段
-	_load_board(gs, "2 2 3 2 .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("H no segment", gs.find_all_segments().size(), 0)
+	# B6 十字 5 格只算一次：得分 (v+1)*5，能量只 +1
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n. 4 . . .\n4 4 4 . .\n. 4 . . .")
+	regs = gs.find_all_regions()
+	_eq_int("B6 cross detected once", regs.size(), 1)
+	if regs.size() == 1:
+		_eq_int("B6 size 5", regs[0].size, 5)
+	gs.score = 0
+	gs.energy = 0
+	_eq_int("B6 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B6 score (4+1)*5 once", gs.score, 25)
+	_eq_int("B6 energy +1 only once", gs.energy, 1)
+	_eq_str("B6 result fell to the bottom of column 1", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n. 5 . . .")
+
+	# B7 顶端区域的结果会在重力阶段下落
+	_load_board(gs, "6 6 6 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.score = 0
+	_eq_int("B7 resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("B7 score (6+1)*3", gs.score, 21)
+	_eq_str("B7 result falls to the bottom", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n7 . . . .")
 
 
-# ============================================== E / E2 交叉匹配
-
-func _test_cross_matches() -> void:
-	_section("E / E2 横纵交叉：两条线都消除")
-
+func _test_multi_region_round() -> void:
+	_section("B5 同一轮多个独立区域全部结算，格子不被重复处理")
 	var gs = GS.new(12)
 	gs.spawn_enabled = false
-	_load_board(gs, ". 2 . . .\n2 2 2 . .\n. 2 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("E both lines detected", gs.find_all_segments().size(), 2)
-	_eq_int("E tile count before", gs.tile_count(), 5)
+	_load_board(gs, "2 2 2 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n5 5 5 . .")
+	var regs: Array = gs.find_all_regions()
+	_eq_int("two independent regions", regs.size(), 2)
 	gs.score = 0
 	gs.energy = 0
-	_eq_int("E resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("E board", gs.board_text(), ". 3 . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("E score +18 (two events)", gs.score, 18)
-	_eq_int("E energy +2 (two events)", gs.energy, 2)
-	_eq_int("E tiles: 5 -5 +2 placed, spawn off", gs.tile_count(), 2)
-
-	# E2：两段段首格重合（都在角点）
-	_load_board(gs, "2 2 2 . .\n2 . . . .\n2 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("E2 both lines detected", gs.find_all_segments().size(), 2)
-	gs.score = 0
-	gs.energy = 0
-	_eq_int("E2 resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("E2 board", gs.board_text(), "3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("E2 score +18 (still two events)", gs.score, 18)
-	_eq_int("E2 energy +2", gs.energy, 2)
-	_eq_int("E2 shared first cell occupies 1 tile", gs.tile_count(), 1)
+	_eq_int("resolve STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("score = 9 + 18", gs.score, 27)
+	_eq_int("energy +2 (one per region)", gs.energy, 2)
+	_eq_str("both results present after gravity", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n3 . . . .\n6 . . . .")
 
 
-# ============================================== F 连锁
+# ================================================ C. 重力
 
-func _test_chain() -> void:
-	_section("F 连锁：合并产物接上已有同值数字")
-
+func _test_gravity() -> void:
+	_section("C 重力：每列独立压实、保持顺序、空格只在顶部")
 	var gs = GS.new(13)
+
+	# C1/C2 中间有空位 → 上方方块下落且相对顺序不变
+	_load_board(gs, "1 . . . .\n. . . . .\n2 . . . .\n. . . . .\n3 . . . .")
+	gs.apply_gravity()
+	_eq_str("C1/C2 column compacted in order", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 . . . .\n2 . . . .\n3 . . . .")
+
+	# C3 结果下方有空位时也能下落
+	_load_board(gs, ". . . . .\n9 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.apply_gravity()
+	_eq_str("C3 lone tile falls to the bottom", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n9 . . . .")
+
+	# C4 各列独立、不左右移动
+	_load_board(gs, "1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n6 7 8 9 1")
+	gs.apply_gravity()
+	_eq_str("C4 columns are independent", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n6 7 8 9 1")
+	var col_ok := true
+	for c in GS.BOARD_N:
+		if gs.at(3, c) != c + 1 or gs.at(4, c) != (6 + c if c < 4 else 1):
+			col_ok = false
+	_t("C4 per-column values unchanged", col_ok, gs.board_text())
+
+	# C5 重力后每列的空格都只出现在顶部
+	_load_board(gs, "4 . 4 . 4\n. 4 . 4 .\n4 . 4 . 4\n. 4 . 4 .\n4 . 4 . 4")
+	gs.apply_gravity()
+	var holes_ok := true
+	for c in GS.BOARD_N:
+		var seen := false
+		for r in GS.BOARD_N:
+			if gs.at(r, c) == GS.EMPTY:
+				if seen:
+					holes_ok = false
+			else:
+				seen = true
+	_t("C5 holes only at the top of each column", holes_ok, gs.board_text())
+	_eq_int("C5 tile count preserved", gs.tile_count(), 13)
+
+
+# ================================================ D. 顶部随机补充
+
+func _test_top_refill() -> void:
+	_section("D 顶部随机补充：位置=各列顶部空格、取值 {1..5}、可复现、补满 25")
+	var gs = GS.new(14)
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.apply_gravity()
+	_eq_str("fixture settled", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5")
+	_eq_int("20 empty cells before refill", _count_empty(gs), 20)
+	var a0: int = gs.spawn_attempts
+	var d0: int = gs.spawns_done
+	var added: int = gs.refill_tops()
+	_eq_int("D1 one new tile per top hole", added, 20)
+	_eq_int("D5 attempts == generated tiles", gs.spawn_attempts - a0, 20)
+	_eq_int("D5 generated == top holes", gs.spawns_done - d0, 20)
+	_eq_int("D4 board is full again", gs.tile_count(), GS.CELL_COUNT)
+	_eq_int("D4 no empty cells left", _count_empty(gs), 0)
+	var bottom_ok := true
+	for c in GS.BOARD_N:
+		if gs.at(4, c) != c + 1:
+			bottom_ok = false
+	_t("existing tiles were not overwritten", bottom_ok, gs.board_text())
+	_t("D2 all refilled values in {1..5}", _all_cells_between(gs, GS.SPAWN_MIN, GS.SPAWN_MAX), gs.board_text())
+
+	# D2 大样本：500 次补充的取值全部合法且 5 个值都出现过
+	var counts := {}
+	for v in range(GS.SPAWN_MIN, GS.SPAWN_MAX + 1):
+		counts[v] = 0
+	var out_of_range := 0
+	for i in 500:
+		_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+		gs.apply_gravity()
+		gs.refill_tops()
+		for r in 4:
+			for c in GS.BOARD_N:
+				var v := gs.at(r, c)
+				if v < GS.SPAWN_MIN or v > GS.SPAWN_MAX:
+					out_of_range += 1
+				else:
+					counts[v] += 1
+	_eq_int("D2 10000 refilled values all in range", out_of_range, 0)
+	var lo := 99999
+	var hi := 0
+	for v in counts:
+		if counts[v] < lo:
+			lo = counts[v]
+		if counts[v] > hi:
+			hi = counts[v]
+	print("   refill distribution over 10000 samples: ", str(counts))
+	_t("D2 every value 1..5 appears", lo > 0, "counts=%s" % str(counts))
+	_t("D2 distribution roughly uniform", lo >= 10000 / 10 and hi <= 10000 / 10 * 3, "counts=%s" % str(counts))
+
+	# D3 固定 seed 复现
+	var x = GS.new(77)
+	var y = GS.new(77)
+	x.rng.seed = 555
+	y.rng.seed = 555
+	for i in 2:
+		_load_board(x, EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+		_load_board(y, EMPTY_ROW + "\n" + EMPTY_ROW + "\n1 2 3 4 5\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+		x.apply_gravity()
+		y.apply_gravity()
+		x.refill_tops()
+		y.refill_tops()
+	_eq_str("D3 same seed + same sequence → identical board", x.board_signature(), y.board_signature())
+	_eq_str("D3 board text", x.board_text(), y.board_text())
+
+
+# ================================================ E1 补充触发连锁（受控随机）
+
+func _test_chain_by_refill() -> void:
+	_section("E1 补充的新方块触发下一轮合并（受控 seed）")
+	# (0,0) 是唯一空格，其两个邻居都是 3 → 只要补出来的是 3 就立刻形成 L 形三连
+	var fixture := ". 3 1 2 1\n3 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1"
+	var gs = GS.new(15)
+	_load_board(gs, fixture)
+	_eq_int("fixture is full except (0,0)", gs.tile_count(), 24)
+	_eq_int("fixture has exactly one hole", _count_empty(gs), 1)
+	_t("fixture has no mergeable region", gs.find_all_regions().is_empty(), gs.board_text())
+
+	var desired := 3
+	var found := -1
+	for s in range(0, 5000):
+		var r := RandomNumberGenerator.new()
+		r.seed = s
+		if r.randi_range(GS.SPAWN_MIN, GS.SPAWN_MAX) == desired:
+			found = s
+			break
+	_t("found a seed producing the desired refill value", found >= 0)
+
+	gs.rng.seed = found
+	_eq_int("refill fills the single hole", gs.refill_tops(), 1)
+	_eq_int("refilled value landed on top of its column", gs.at(0, 0), desired)
+	var regs: Array = gs.find_all_regions()
+	_eq_int("refilled tile completed a region", regs.size(), 1)
+	if regs.size() == 1:
+		_eq_int("region size from refill", regs[0].size, 3)
+		_eq_cells("region cells", regs[0].cells, [0, 1, 5])
+
+	gs.spawn_enabled = false                 # 让本轮结算结果唯一可断言
+	gs.score = 0
+	gs.energy = 0
+	_eq_int("chain resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
+	_eq_int("score from the region", gs.score, (3 + 1) * 3)
+	_eq_int("energy from the region", gs.energy, 1)
+	# 列 0 原有 1,2,1 三个方块 → 合并结果 4 压在这三者之上，落在倒数第 4 行
+	_eq_str("board after gravity (order preserved, 4 on top of column 0)", gs.board_text(),
+		". . 1 2 1\n4 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1")
+	_eq_int("column 0 row 1 holds the merged result", gs.at(1, 0), 4)
+	_eq_int("column 0 top row is now empty", gs.at(0, 0), GS.EMPTY)
+	_eq_int("column 0 keeps its original order below", gs.at(2, 0), 1)
+	_eq_int("column 0 keeps its original order below (2)", gs.at(3, 0), 2)
+	_eq_int("column 0 keeps its original order below (3)", gs.at(4, 0), 1)
+	_t("board is stable afterwards", gs.find_all_regions().is_empty(), gs.board_text())
+
+
+# ================================================ E 连锁与能量
+
+func _test_chain_and_energy() -> void:
+	_section("E2-E6 连锁、能量扣除与上限")
+	var gs = GS.new(16)
 	gs.spawn_enabled = false
+	# E2 两轮连锁：纵列 4 合成 5 → 重力后横排 5,5,5 → 再合成 6
 	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
 	gs.score = 0
 	gs.energy = 2
-	_t("F tap accepted", gs.tap(2, 0) == true)
-	_eq_str("F board after chain", gs.board_text(), "6 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("F score +33 (15 then 18)", gs.score, 33)
-	_eq_int("F energy 2 -1 +1 +1", gs.energy, 3)
-	_t("F board is stable", gs.find_all_segments().is_empty())
-	_eq_int("F no spawn attempts while spawn disabled", gs.spawn_attempts, 0)
+	_t("E2 tap accepted", gs.tap(2, 0) == true)
+	_eq_int("E2 score 15 + 18", gs.score, 33)
+	_eq_int("E4 one tap costs exactly 1 energy", gs.energy, 3)
+	_eq_str("E2 final board after the whole chain", gs.board_text(),
+		EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n6 . . . .")
+	_t("E2 chain ends on a stable board", gs.find_all_regions().is_empty())
 
-
-# ============================================== K 密集区块
-
-func _test_dense_block() -> void:
-	_section("K 3x3 全同值区块：多段重叠 + 多轮连锁")
-
-	var gs = GS.new(14)
-	gs.spawn_enabled = false
-	_load_board(gs, EMPTY_ROW + "\n. 3 3 3 .\n. 3 3 3 .\n. 3 3 3 .\n" + EMPTY_ROW)
-	_eq_int("K six segments in one round", gs.find_all_segments().size(), 6)
-	_eq_int("K tiles before", gs.tile_count(), 9)
+	# E5 能量上限
+	_load_board(gs, EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n2 2 2 . .")
+	gs.energy = GS.ENERGY_MAX
 	gs.score = 0
-	gs.energy = 0
-	_eq_int("K resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("K final board", gs.board_text(), EMPTY_ROW + "\n. 5 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("K score +102 (72 then 30)", gs.score, 102)
-	_eq_int("K energy capped at 5", gs.energy, GS.ENERGY_MAX)
-	_eq_int("K tiles 9 -> 1 (distinct first cells, not segment count)", gs.tile_count(), 1)
+	gs.resolve_all()
+	_eq_int("E5 energy stays capped", gs.energy, GS.ENERGY_MAX)
+	_eq_int("E5 score still awarded", gs.score, 9)
+
+	# E6 最后一格能量被扣除后发生合并 → 结算完仍可继续
+	_load_board(gs, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	gs.energy = 1
+	gs.score = 0
+	gs.revive_left = 1
+	gs.phase = GS.Phase.PLAYING
+	_t("E6 tap accepted", gs.tap(0, 2) == true)
+	_eq_int("E6 energy settles back to 1", gs.energy, 1)
+	_eq_int("E6 game continues", gs.phase, GS.Phase.PLAYING)
+	_eq_int("E6 result at bottom of column 0", gs.at(4, 0), 3)
 
 
-# ============================================== 点击规则
+# ================================================ 点击规则 / 能量 / 复活
 
 func _test_tap_rules() -> void:
-	_section("M/点击规则：空格、越界、非法状态")
-
-	var gs = GS.new(15)
+	_section("M 点击规则：空格、越界、非法状态")
+	var gs = GS.new(17)
 	gs.spawn_enabled = false
-	_load_board(gs, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, SINGLE_TILE)
 	gs.energy = 3
 	gs.score = 0
-	var before: String = gs.board_signature()
+	var before := gs.board_signature()
 	_t("tap empty cell refused", gs.tap(0, 1) == false)
 	_eq_str("empty tap leaves board", gs.board_signature(), before)
 	_eq_int("empty tap costs no energy", gs.energy, 3)
 	_eq_int("empty tap gives no score", gs.score, 0)
-
 	_t("out of bounds refused (5,0)", gs.tap(5, 0) == false)
 	_t("out of bounds refused (-1,0)", gs.tap(-1, 0) == false)
 	_eq_int("out of bounds costs no energy", gs.energy, 3)
@@ -281,47 +550,22 @@ func _test_tap_rules() -> void:
 	gs.phase = GS.Phase.GAME_OVER
 	_t("tap refused after GAME_OVER", gs.tap(0, 0) == false)
 	_eq_str("GAME_OVER tap leaves board", gs.board_signature(), before)
-
 	gs.phase = GS.Phase.ERROR
 	_t("tap refused while ERROR", gs.tap(0, 0) == false)
 
 
-# ============================================== J/L/M 能量与结束判定
-
 func _test_energy_and_game_over() -> void:
-	_section("J/L/M 能量扣除、每段回能、上限、先结算后判定")
-
-	# J：无消除 → 只扣能量
-	var gs = GS.new(16)
+	_section("J/L 能量扣除与结束判定")
+	var gs = GS.new(18)
 	gs.spawn_enabled = false
-	_load_board(gs, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, SINGLE_TILE)
 	gs.energy = 5
 	gs.score = 0
 	_t("J tap accepted", gs.tap(0, 0) == true)
 	_eq_int("J score +0 without merge", gs.score, 0)
 	_eq_int("J energy 5 -> 4", gs.energy, 4)
 
-	# J2：能量已满时消除不再增加
-	_load_board(gs, "2 2 2 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	gs.energy = GS.ENERGY_MAX
-	gs.score = 0
-	gs.resolve_all()
-	_eq_int("J2 energy stays capped", gs.energy, GS.ENERGY_MAX)
-	_eq_int("J2 score still awarded", gs.score, 9)
-
-	# M：消耗掉最后一格能量但随后发生消除 → 结算后能量为 1，游戏继续
-	_load_board(gs, "2 2 1 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	gs.energy = 1
-	gs.score = 0
-	gs.revive_left = 1
-	gs.phase = GS.Phase.PLAYING
-	_t("M tap accepted", gs.tap(0, 2) == true)
-	_eq_str("M board", gs.board_text(), "3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	_eq_int("M energy settles to 1", gs.energy, 1)
-	_eq_int("M game continues", gs.phase, GS.Phase.PLAYING)
-
-	# L：消耗掉最后一格能量且没有消除 → 能量 0 → 进入复活询问
-	_load_board(gs, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, SINGLE_TILE)
 	gs.energy = 1
 	gs.revive_left = 1
 	gs.phase = GS.Phase.PLAYING
@@ -329,8 +573,7 @@ func _test_energy_and_game_over() -> void:
 	_eq_int("L energy 0", gs.energy, 0)
 	_eq_int("L asks for revive", gs.phase, GS.Phase.REVIVE_PROMPT)
 
-	# L2：没有复活次数时直接结束
-	_load_board(gs, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, SINGLE_TILE)
 	gs.energy = 1
 	gs.revive_left = 0
 	gs.phase = GS.Phase.PLAYING
@@ -339,12 +582,9 @@ func _test_energy_and_game_over() -> void:
 	_t("L2 is_game_over()", gs.is_game_over())
 
 
-# ============================================== 复活
-
 func _test_revive() -> void:
 	_section("复活：能量 3、次数 -1、棋盘与分数不变")
-
-	var gs = GS.new(17)
+	var gs = GS.new(19)
 	gs.spawn_enabled = false
 	_load_board(gs, "4 5 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
 	gs.energy = 1
@@ -363,16 +603,14 @@ func _test_revive() -> void:
 	_eq_int("score unchanged by revive", gs.score, score_before)
 	_t("second revive refused", gs.revive() == false)
 
-	# 次数用尽后再耗尽 → 直接结束
-	_load_board(gs, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs, SINGLE_TILE)
 	gs.energy = 1
 	gs.tap(0, 0)
 	_eq_int("second depletion ends the game", gs.phase, GS.Phase.GAME_OVER)
 
-	# 放弃复活
-	var gs2 = GS.new(18)
+	var gs2 = GS.new(20)
 	gs2.spawn_enabled = false
-	_load_board(gs2, "5 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
+	_load_board(gs2, SINGLE_TILE)
 	gs2.energy = 1
 	gs2.tap(0, 0)
 	_eq_int("prompt shown", gs2.phase, GS.Phase.REVIVE_PROMPT)
@@ -383,24 +621,22 @@ func _test_revive() -> void:
 	_t("give_up twice refused", gs2.give_up() == false)
 
 
-# ============================================== 连锁上限 → ERROR
+# ================================================ E7 连锁上限 → ERROR
 
 func _test_chain_limit_is_error() -> void:
-	_section("T 连锁步数上限：不得静默继续，必须进入 ERROR")
-
-	var gs = GS.new(19)
+	_section("E7 连锁步数上限：不得静默继续，必须进入 ERROR")
+	var gs = GS.new(21)
 	gs.spawn_enabled = false
 	_load_board(gs, "4 5 5 . .\n4 . . . .\n3 . . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	gs.max_chain_steps = 1          # F 场景需要 2 轮，这里只允许 1 轮
+	gs.max_chain_steps = 1                 # 该场景需要 2 轮
 	gs.energy = 3
 	gs.score = 0
 	var accepted: bool = gs.tap(2, 0)
 	_t("tap reports failure", accepted == false)
 	_eq_int("phase is ERROR", gs.phase, GS.Phase.ERROR)
 	_t("error message recorded", gs.error_message != "", gs.error_message)
-	_t("board is NOT claimed stable", gs.has_unresolved_matches(), "expected unresolved match, board:\n" + gs.board_text())
+	_t("board is NOT claimed stable", gs.has_unresolved_matches(), gs.board_text())
 	_eq_int("score from completed rounds kept", gs.score, 15)
-
 	var frozen: String = gs.board_signature()
 	_t("further taps refused", gs.tap(0, 0) == false)
 	_eq_str("board frozen after ERROR", gs.board_signature(), frozen)
@@ -409,115 +645,22 @@ func _test_chain_limit_is_error() -> void:
 	_eq_int("phase stays ERROR", gs.phase, GS.Phase.ERROR)
 
 
-# ============================================== 随机补充
+# ================================================ F4 确定性
 
-func _test_spawn_basics() -> void:
-	_section("S1/S2/S3 每个消除事件一次补充尝试")
-
-	var gs = GS.new(20)
-	gs.spawn_enabled = true
-	_load_board(gs, "2 2 2 . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	var a0: int = gs.spawn_attempts
-	var d0: int = gs.spawns_done
-	gs.score = 0
-	gs.energy = 0
-	_eq_int("S1 resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_int("S1 one attempt for one segment", gs.spawn_attempts - a0, 1)
-	_eq_int("S1 one successful spawn", gs.spawns_done - d0, 1)
-	_eq_int("S1 tiles 3 -3 +1 placed +1 spawned", gs.tile_count(), 2)
-	_t("S1 board stable after spawn", gs.find_all_segments().is_empty(), gs.board_text())
-	_eq_int("S1 score unchanged by spawn", gs.score, 9)
-
-	# S2：一次点击两个消除事件 → 两次补充尝试
-	_load_board(gs, ". 2 . . .\n2 2 2 . .\n. 2 . . .\n" + EMPTY_ROW + "\n" + EMPTY_ROW)
-	a0 = gs.spawn_attempts
-	d0 = gs.spawns_done
-	gs.score = 0
-	gs.energy = 0
-	_eq_int("S2 resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_int("S2 two attempts for two segments", gs.spawn_attempts - a0, 2)
-	_eq_int("S2 two successful spawns", gs.spawns_done - d0, 2)
-	_eq_int("S2 tiles 5 -5 +2 placed +2 spawned", gs.tile_count(), 4)
-
-	# S3：棋盘已满时补充失败但不崩溃
-	var full = GS.new(21)
-	_eq_int("S3 initial board is full", full.tile_count(), GS.CELL_COUNT)
-	var fa: int = full.spawn_attempts
-	var fd: int = full.spawns_done
-	_t("S3 spawn on full board returns false", full.spawn_one() == false)
-	_eq_int("S3 attempt counted", full.spawn_attempts - fa, 1)
-	_eq_int("S3 no successful spawn", full.spawns_done - fd, 0)
-	_eq_int("S3 board untouched", full.tile_count(), GS.CELL_COUNT)
-	_eq_int("S3 still PLAYING", full.phase, GS.Phase.PLAYING)
-
-
-func _test_spawn_value_range() -> void:
-	_section("S5 补充数字必须落在 {1..5} 且分布均匀")
-
-	# 只有一个空格的棋盘 → 位置固定，便于直接读取抽出的数值
-	var one_empty := "2 . 2 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2"
-	var gs = GS.new(22)
-	_load_board(gs, one_empty)
-	_eq_int("fixture has exactly one empty cell", gs.tile_count(), GS.CELL_COUNT - 1)
-
-	var counts := {}
-	for v in range(GS.SPAWN_MIN, GS.SPAWN_MAX + 1):
-		counts[v] = 0
-	var samples := 500
-	var out_of_range := 0
-	var spawn_failures := 0
-	for i in samples:
-		if not gs.spawn_one():
-			spawn_failures += 1
-			continue
-		var v: int = gs.at(0, 1)
-		if v < GS.SPAWN_MIN or v > GS.SPAWN_MAX:
-			out_of_range += 1
-		else:
-			counts[v] += 1
-		_load_board(gs, one_empty)          # 复位棋盘，但 rng 继续前进
-
-	_eq_int("all 500 spawn attempts succeeded", spawn_failures, 0)
-	_eq_int("500 spawns all within range", out_of_range, 0)
-	print("   spawn distribution over %d samples: %s" % [samples, str(counts)])
-	var lo := samples
-	var hi := 0
-	for v in counts:
-		if counts[v] < lo:
-			lo = counts[v]
-		if counts[v] > hi:
-			hi = counts[v]
-	_t("every value 1..5 appears", lo > 0, "counts=%s" % str(counts))
-	_t("distribution roughly uniform", lo >= samples / 10 and hi <= samples / 10 * 3, "counts=%s" % str(counts))
-
-
-func _test_spawn_reproducibility() -> void:
-	_section("S4 补充位置与数值均可用固定 seed 复现")
-
-	# 定点测试：相同 seed、相同棋盘、相同调用序列
-	var text := "2 . 2 . 2\n. 2 . 2 .\n2 . 2 . 2\n. 2 . 2 .\n2 . 2 . 2"
-	var a = GS.new(0)
-	var b = GS.new(0)
-	_load_board(a, text)
-	_load_board(b, text)
-	a.rng.seed = 777
-	b.rng.seed = 777
-	for i in 3:
-		a.spawn_one()
-		b.spawn_one()
-	_eq_str("spawned positions+values reproducible", a.board_signature(), b.board_signature())
-	_t("spawns actually happened", a.spawns_done >= 3, "spawns=%d" % a.spawns_done)
-	_eq_str("spawn signature", a.board_text(), b.board_text())
-
-	# 整局测试：同一 seed + 同一操作序列 → 完全一致
+func _test_determinism() -> void:
+	_section("F4 固定 seed 的完整操作序列确定性（含顶部补充）")
 	var coords := [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [0, 4], [4, 0], [2, 1], [1, 3], [3, 2]]
-	var g1 = GS.new(20261009)
-	var g2 = GS.new(20261009)
-	for i in 40:
+	var g1 = GS.new(20261010)
+	var g2 = GS.new(20261010)
+	var steps := 0
+	for i in 60:
 		var p: Array = coords[i % coords.size()]
 		var r1: bool = g1.tap(p[0], p[1])
 		var r2: bool = g2.tap(p[0], p[1])
 		_t("tap result identical at step %d" % i, r1 == r2)
+		steps += 1
+		_eq_int("board stays full after step %d" % i, g1.tile_count(), GS.CELL_COUNT)
+		_t("board stable after step %d" % i, g1.find_all_regions().is_empty(), g1.board_text())
 		if g1.phase == GS.Phase.REVIVE_PROMPT:
 			g1.revive()
 			g2.revive()
@@ -527,57 +670,17 @@ func _test_spawn_reproducibility() -> void:
 	_eq_int("full-game scores identical", g1.score, g2.score)
 	_eq_int("full-game energy identical", g1.energy, g2.energy)
 	_eq_int("full-game phases identical", g1.phase, g2.phase)
-	_eq_int("full-game spawn attempts identical", g1.spawn_attempts, g2.spawn_attempts)
-	_eq_int("full-game spawn successes identical", g1.spawns_done, g2.spawns_done)
-	_t("the random run actually spawned", g1.spawns_done > 0, "spawns=%d" % g1.spawns_done)
-	_t("no unresolved match left at the end", g1.find_all_segments().is_empty(), g1.board_text())
+	_eq_int("full-game refill counts identical", g1.spawns_done, g2.spawns_done)
+	_eq_int("full-game refill attempts identical", g1.spawn_attempts, g2.spawn_attempts)
+	_t("refills actually happened", g1.spawns_done > 0, "spawns=%d" % g1.spawns_done)
+	_t("final board is full", g1.tile_count() == GS.CELL_COUNT, g1.board_text())
+	_t("final board is stable", g1.find_all_regions().is_empty(), g1.board_text())
 
 
-func _test_spawn_participates_in_chain() -> void:
-	_section("S5b 补充的数字参与同一轮之后的连锁")
-
-	# 只有 (0,1) 是空格，且左右邻居都是 2 → 只要补充值是 2 就立刻三连
-	var fixture := "2 . 2 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2"
-	var gs = GS.new(23)
-	_load_board(gs, fixture)
-	_eq_int("fixture has exactly one empty cell", gs.tile_count(), GS.CELL_COUNT - 1)
-	_t("fixture itself has no match", gs.find_all_segments().is_empty(), gs.board_text())
-
-	# 暴力搜索一个 seed，使其"第二次抽签"（数值）恰好为 2
-	var desired := 2
-	var found := -1
-	for s in range(0, 500):
-		var r := RandomNumberGenerator.new()
-		r.seed = s
-		r.randi_range(0, 0)                                   # 位置抽签（唯一空格 → 范围 0..0）
-		if r.randi_range(GS.SPAWN_MIN, GS.SPAWN_MAX) == desired:
-			found = s
-			break
-	_t("found a seed producing the desired spawn value", found >= 0, "searched 500 seeds")
-
-	gs.rng.seed = found
-	_t("controlled spawn succeeds", gs.spawn_one() == true)
-	_eq_int("spawned value landed in the only empty cell", gs.at(0, 1), desired)
-	_eq_int("spawned cell completed a triple", gs.find_all_segments().size(), 1)
-
-	# 关闭本轮的自动补充，让这次结算的棋盘结果唯一可断言
-	# （参与连锁的是上面那次受控补充出来的数字）
-	gs.spawn_enabled = false
-	gs.score = 0
-	gs.energy = 0
-	_eq_int("chain after spawn resolves STABLE", gs.resolve_all(), GS.ResolveResult.STABLE)
-	_eq_str("board after spawned triple merged", gs.board_text(),
-		"3 . . 1 2\n1 2 1 2 1\n2 1 2 1 2\n1 2 1 2 1\n2 1 2 1 2")
-	_eq_int("score from spawned triple", gs.score, 9)
-	_eq_int("energy from spawned triple", gs.energy, 1)
-	_t("board stable at the end", gs.find_all_segments().is_empty(), gs.board_text())
-
-
-# ============================================== 最高分持久化
+# ================================================ F3 最高分
 
 func _test_score_store() -> void:
-	_section("最高分写入与重新读取")
-
+	_section("F3 最高分写入与重新读取")
 	_remove_test_save()
 	var store = SS.new(TEST_SAVE_PATH)
 	_eq_int("missing file → 0", store.load_best(), 0)
@@ -588,7 +691,6 @@ func _test_score_store() -> void:
 	_t("higher score overwrites", store.save_best(9999) == true)
 	_eq_int("value after overwrite", store.load_best(), 9999)
 
-	# 损坏文件不应崩溃，视为无记录
 	var f := FileAccess.open(TEST_SAVE_PATH, FileAccess.WRITE)
 	if f != null:
 		f.store_string("this is not a ConfigFile at all")
