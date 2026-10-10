@@ -31,4 +31,9 @@ horizontal_alignment = 1
 layout_mode = 2
 text = "+1"
 
+[node name="ResetButton" type="Button" parent="CenterContainer/VBoxContainer"]
+layout_mode = 2
+text = "Reset"
+
 [connection signal="pressed" from="CenterContainer/VBoxContainer/PlusOneButton" to="." method="_on_plus_one_button_pressed"]
+[connection signal="pressed" from="CenterContainer/VBoxContainer/ResetButton" to="." method="_on_reset_button_pressed"]
