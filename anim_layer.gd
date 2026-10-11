@@ -197,8 +197,8 @@ func _show_all_static() -> void:
 	for i in GS.CELL_COUNT:
 		var tile = _tile(i)
 		if tile != null:
-			tile.set_ghosted(false)
-			tile.scale = Vector2.ONE
+			# 透明度 / 缩放 / 颜色一次性恢复到当前数值应有的样子
+			tile.reset_visual_state()
 
 
 func _tile(index: int):

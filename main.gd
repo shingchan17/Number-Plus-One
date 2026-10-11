@@ -26,7 +26,7 @@ var _animating: bool = false
 ## 回合序号：重开或取消后递增，用于识别"已经过期的播放/等待"。
 var _turn_generation: int = 0
 
-@onready var board = $Root/Layout/BoardWrapper/BoardStack/Board
+@onready var board = $Root/Layout/BoardWrapper/BoardStack/BoardMargin/Board
 @onready var anim_layer = $Root/Layout/BoardWrapper/BoardStack/AnimLayer
 @onready var score_label: Label = $Root/Layout/TopBar/ScoreLabel
 @onready var best_label: Label = $Root/Layout/TopBar/BestLabel

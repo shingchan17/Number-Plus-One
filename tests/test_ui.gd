@@ -11,6 +11,7 @@ extends SceneTree
 
 const GS = preload("res://game_state.gd")
 const SS = preload("res://score_store.gd")
+const TileViewScript = preload("res://tile_view.gd")
 
 const TEST_SAVE_PATH := "user://test_ui_highscore.cfg"
 const SEED := 20261010
@@ -70,6 +71,7 @@ func _run() -> void:
 	await _test_restart_flow()
 	await _test_error_state()
 	await _test_animations()
+	await _test_visual_rules()
 	await _test_animation_cancel()
 
 	_remove_test_save()
@@ -968,3 +970,196 @@ func _test_animation_cancel() -> void:
 	_eq_int("clicks still work without the animation layer", main.state.energy, energy_before - 1)
 	_eq_int("phase still PLAYING", main.state.phase, GS.Phase.PLAYING)
 	_check_ui_matches_state("动画层释放后")
+
+
+# ==================================================================== P3 视觉规则
+
+func _visual_color_eq(tag: String, a: Color, b: Color) -> void:
+	_eq_str(tag, a.to_html(false), b.to_html(false))
+
+
+## 视觉残留检查：透明度 / 缩放 / 文字 / 每个格子的颜色都必须与自身数值一致。
+func _check_visual_state(tag: String) -> void:
+	var clean := true
+	var colored := true
+	for i in GS.CELL_COUNT:
+		var t = main.board.tile_at(i / GS.BOARD_N, i % GS.BOARD_N)
+		if t.modulate.a < 0.999 or t.scale != Vector2.ONE:
+			clean = false
+		if t.value == GS.EMPTY:
+			if t.text != "":
+				clean = false
+		else:
+			if t.text != str(t.value):
+				clean = false
+			if t.stylebox_color("normal") != TileViewScript.color_for(t.value):
+				colored = false
+	_t("[%s] no visual residue (alpha / scale / text)" % tag, clean)
+	_t("[%s] every tile shows the color of its own value" % tag, colored)
+
+
+func _test_visual_rules() -> void:
+	_section("P3 视觉：颜色映射、共享样式、状态反馈、无残留")
+
+	# ---- 1) 1~5 各有一种有效且互不相同的颜色
+	var seen := {}
+	var distinct := true
+	var opaque := true
+	for v in [1, 2, 3, 4, 5]:
+		var c: Color = TileViewScript.color_for(v)
+		if c.a < 1.0:
+			opaque = false
+		var key := c.to_html(false)
+		if seen.has(key):
+			distinct = false
+		seen[key] = true
+	_t("1..5 are all opaque", opaque)
+	_t("1..5 use 5 different colors", distinct)
+
+	# 不能只靠"细微色差"区分：色相间隔必须明显
+	var hues: Array = []
+	for v in [1, 2, 3, 4, 5]:
+		hues.append(TileViewScript.color_for(v).h)
+	var min_gap := 1.0
+	for i in hues.size():
+		for j in range(i + 1, hues.size()):
+			var d: float = absf(hues[i] - hues[j])
+			d = minf(d, 1.0 - d)
+			min_gap = minf(min_gap, d)
+	_t("1..5 differ by a clear hue gap (>= 0.06)", min_gap >= 0.06, "min_gap=%.3f" % min_gap)
+
+	# ---- 2) >5 一定有确定、有效的颜色（不越界、不无效、不撞色）
+	var high_ok := true
+	var high_distinct := true
+	var prev := Color(0, 0, 0, 0)
+	for v in range(6, 61):
+		var c: Color = TileViewScript.color_for(v)
+		if c.a < 1.0 or c.to_html(false) == "000000":
+			high_ok = false
+		if TileViewScript.color_for(v) != c:
+			high_ok = false                       # 同一数值必须稳定
+		if v > 6 and c.to_html(false) == prev.to_html(false):
+			high_distinct = false
+		prev = c
+	_t("values > 5 always produce a valid, stable color", high_ok)
+	_t("consecutive values > 5 do not share a color", high_distinct)
+	var huge: Color = TileViewScript.color_for(99999)
+	_t("very large value still yields a valid color", huge.a == 1.0 and huge.to_html(false) != "000000")
+	_t("empty cell has no background color", TileViewScript.color_for(GS.EMPTY).a == 0.0)
+
+	# ---- 3) 文字与底色对比度达标（可读性用数值验证，不靠肉眼）
+	var worst := 99.0
+	for v in [1, 2, 3, 4, 5, 6, 8, 12, 25, 60]:
+		var bg: Color = TileViewScript.color_for(v)
+		worst = minf(worst, TileViewScript.contrast_ratio(TileViewScript.text_color_for(bg), bg))
+	_t("text/background contrast >= 4.5 for every sampled value", worst >= TileViewScript.MIN_CONTRAST, "worst=%.2f" % worst)
+
+	# ---- 4) 同一数值多次渲染完全一致；数值变化时样式跟着更新
+	var t_a = main.board.tile_at(0, 0)
+	var t_b = main.board.tile_at(4, 4)
+	t_a.set_value(7)
+	t_b.set_value(7)
+	_visual_color_eq("same value -> same background", t_a.background_color(), t_b.background_color())
+	_visual_color_eq("same value -> same normal stylebox", t_a.stylebox_color("normal"), t_b.stylebox_color("normal"))
+	_eq_int("same value -> same font size", t_a.get_theme_font_size("font_size"), t_b.get_theme_font_size("font_size"))
+	t_a.set_value(1)
+	var c_1: Color = t_a.stylebox_color("normal")
+	t_a.set_value(4)
+	var c_4: Color = t_a.stylebox_color("normal")
+	_t("stylebox follows the new value", c_1 != c_4)
+	_visual_color_eq("value 1 uses the palette color", c_1, TileViewScript.color_for(1))
+	_visual_color_eq("value 4 uses the palette color", c_4, TileViewScript.color_for(4))
+	_eq_str("tile text follows the value", t_a.text, "4")
+
+	# ---- 5) 状态反馈：普通 / 悬停 / 按下 / 禁用 各不相同，且都保持可读
+	var states_distinct := true
+	var states_readable := true
+	for v in [1, 3, 6, 15]:
+		t_a.set_value(v)
+		var normal: Color = t_a.stylebox_color("normal")
+		var hover: Color = t_a.stylebox_color("hover")
+		var down: Color = t_a.stylebox_color("pressed")
+		var off: Color = t_a.stylebox_color("disabled")
+		if normal == hover or normal == down or normal == off:
+			states_distinct = false
+		for c in [normal, hover, down, off]:
+			if TileViewScript.contrast_ratio(TileViewScript.text_color_for(c), c) < TileViewScript.MIN_CONTRAST:
+				states_readable = false
+	_t("normal / hover / pressed / disabled are visually distinct", states_distinct)
+	_t("digits stay readable in every state", states_readable)
+
+	# ---- 6) 字号规则：位数越多越小，始终可用，4 位数不溢出
+	var fs1: int = TileViewScript.font_size_for(104.0, 1)
+	var fs2: int = TileViewScript.font_size_for(104.0, 2)
+	var fs3: int = TileViewScript.font_size_for(104.0, 3)
+	var fs4: int = TileViewScript.font_size_for(104.0, 4)
+	_t("font size shrinks as digits grow", fs1 > fs2 and fs2 > fs3 and fs3 >= fs4)
+	_t("font size stays usable for 4 digits", fs4 >= 10)
+	var width_ok := true
+	var checked := 0
+	for v in [7, 42, 512, 4096]:
+		t_a.set_value(v)
+		if t_a.size.x < 20.0:
+			continue
+		checked += 1
+		var fs: int = t_a.get_theme_font_size("font_size")
+		if fs * 0.62 * str(v).length() >= t_a.size.x:
+			width_ok = false
+	_t("even 4-digit numbers fit inside the cell (%d sizes checked)" % checked, width_ok and checked > 0)
+
+	# ---- 7) 输入禁用只影响输入，不阻断视觉刷新
+	main.start_new_game(SEED)
+	_load_fixture(SINGLE_TILE_BOARD, 5, 0, 1)
+	main.board.set_input_enabled(false)
+	_t("input is disabled", main.board.tile_at(0, 0).disabled == true)
+	main.board.tile_at(0, 0).set_value(9)
+	_eq_str("disabled tile still updates its text", main.board.tile_at(0, 0).text, "9")
+	_visual_color_eq("disabled tile still updates its color",
+		main.board.tile_at(0, 0).stylebox_color("normal"), TileViewScript.color_for(9))
+	main.board.tile_at(1, 1).set_value(2)
+	_eq_str("another cell refreshed too", main.board.tile_at(1, 1).text, "2")
+	_t("disabled state has its own background",
+		main.board.tile_at(1, 1).stylebox_color("disabled") != main.board.tile_at(1, 1).stylebox_color("normal"))
+
+	# ---- 8) 动画临时方块与静态方块共用同一套样式规则
+	main.set_animations_enabled(true)
+	main.anim_layer.time_scale = 0.5
+	_sig_finished = 0
+	_sig_canceled = 0
+	main.start_new_game(SEED)
+	_load_fixture(MERGE_FIXTURE, 5, 0, 1)
+	main.board.tile_at(0, 2).pressed.emit()
+	await _await_until(func(): return main.anim_layer.ghost_count() > 0, "ghost exists for style check")
+	var ghost = main.anim_layer.get_child(0)
+	var ghost_value: int = ghost.value
+	_t("ghost carries a real value", ghost_value > 0, "value=%d" % ghost_value)
+	var static_tile = main.board.tile_at(4, 4)
+	static_tile.set_value(ghost_value)
+	_visual_color_eq("ghost and static tile share the same background",
+		ghost.stylebox_color("normal"), static_tile.stylebox_color("normal"))
+	_visual_color_eq("ghost and static tile share the same hover background",
+		ghost.stylebox_color("hover"), static_tile.stylebox_color("hover"))
+	_eq_int("ghost and static tile share the same font size",
+		ghost.get_theme_font_size("font_size"), static_tile.get_theme_font_size("font_size"))
+	_visual_color_eq("ghost and static tile share the same text color",
+		ghost.get_theme_color("font_color"), static_tile.get_theme_color("font_color"))
+	_t("ghost never takes mouse input", ghost.mouse_filter == Control.MOUSE_FILTER_IGNORE)
+	await _await_animation()
+	_check_visual_state("动画完成后")
+
+	# ---- 9) 取消动画后同样没有视觉残留
+	main.start_new_game(SEED)
+	_load_fixture(MERGE_FIXTURE, 5, 0, 1)
+	main.board.tile_at(0, 2).pressed.emit()
+	await _await_until(func(): return main.anim_layer.ghost_count() > 0, "ghost exists before cancel")
+	main.anim_layer.cancel_play()
+	await _await_until(func(): return not main.is_animating(), "unlocked after cancel")
+	_eq_int("no ghost objects left after cancel", main.anim_layer.ghost_count(), 0)
+	_check_visual_state("取消后")
+
+	# ---- 10) 真实刷新路径：整盘刷新后每个格子都是自己数值的颜色
+	main.start_new_game(SEED)
+	_load_fixture(PLAYER_CHAIN_FIXTURE, 5, 0, 1)
+	_check_visual_state("整盘刷新后")
+
+	main.set_animations_enabled(false)
